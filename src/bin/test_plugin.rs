@@ -1,0 +1,109 @@
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Command, Stdio};
+
+use serde_json::json;
+
+fn redis_params() -> serde_json::Value {
+    json!({
+        "driver": "redis",
+        "host": "127.0.0.1",
+        "port": 6379
+    })
+}
+
+fn main() {
+    let mut child = Command::new("cargo")
+        .args(["run", "--bin", "tabularis-redis-plugin", "--quiet"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("Failed to spawn plugin");
+
+    let mut stdin = child.stdin.take().expect("Failed to open stdin");
+    let stdout = child.stdout.take().expect("Failed to open stdout");
+
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            println!("PLUGIN: {}", line.unwrap());
+        }
+    });
+
+    let params = redis_params();
+    let requests = vec![
+        json!({
+            "jsonrpc": "2.0",
+            "method": "get_databases",
+            "params": {},
+            "id": 1
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "test_connection",
+            "params": { "params": params },
+            "id": 2
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "get_tables",
+            "params": { "params": params },
+            "id": 3
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "insert_record",
+            "params": {
+                "params": params,
+                "table": "test_data",
+                "data": { "id": "1", "name": "Alice" }
+            },
+            "id": 4
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "insert_record",
+            "params": {
+                "params": params,
+                "table": "test_data",
+                "data": { "id": "2", "name": "Bob" }
+            },
+            "id": 5
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "get_tables",
+            "params": { "params": params },
+            "id": 6
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "execute_query",
+            "params": {
+                "params": params,
+                "query": "SELECT * FROM test_data",
+                "page": 1,
+                "page_size": 10
+            },
+            "id": 7
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "get_columns",
+            "params": { "params": params, "table": "test_data" },
+            "id": 8
+        }),
+    ];
+
+    for req in requests {
+        let mut req_str = serde_json::to_string(&req).unwrap();
+        req_str.push('\n');
+        println!("SENDING: {}", req_str.trim());
+        stdin.write_all(req_str.as_bytes()).unwrap();
+        stdin.flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    drop(stdin);
+    child.wait().unwrap();
+}

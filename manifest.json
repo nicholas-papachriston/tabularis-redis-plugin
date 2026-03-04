@@ -1,0 +1,37 @@
+{
+  "$schema": "https://tabularis.dev/schemas/plugin-manifest.json",
+  "id": "redis",
+  "name": "Redis",
+  "version": "0.1.0",
+  "description": "Redis key-value store with Hash and RedisJSON row storage",
+  "default_port": 6379,
+  "default_username": "",
+  "executable": "tabularis-redis-plugin",
+  "capabilities": {
+    "schemas": false,
+    "views": false,
+    "routines": false,
+    "file_based": false,
+    "folder_based": false,
+    "identifier_quote": "\"",
+    "alter_primary_key": false,
+    "auto_increment_keyword": "",
+    "serial_type": "",
+    "inline_pk": false,
+    "alter_column": false,
+    "create_foreign_keys": false
+  },
+  "data_types": [
+    { "name": "BOOLEAN", "category": "other", "requires_length": false, "requires_precision": false },
+    { "name": "INTEGER", "category": "numeric", "requires_length": false, "requires_precision": false },
+    { "name": "BIGINT", "category": "numeric", "requires_length": false, "requires_precision": false },
+    { "name": "FLOAT", "category": "numeric", "requires_length": false, "requires_precision": false },
+    { "name": "DOUBLE", "category": "numeric", "requires_length": false, "requires_precision": false },
+    { "name": "VARCHAR", "category": "string", "requires_length": true, "requires_precision": false, "default_length": "255" },
+    { "name": "TEXT", "category": "string", "requires_length": false, "requires_precision": false },
+    { "name": "DATE", "category": "date", "requires_length": false, "requires_precision": false },
+    { "name": "TIMESTAMP", "category": "date", "requires_length": false, "requires_precision": false },
+    { "name": "JSON", "category": "json", "requires_length": false, "requires_precision": false },
+    { "name": "UUID", "category": "string", "requires_length": false, "requires_precision": false }
+  ]
+}
