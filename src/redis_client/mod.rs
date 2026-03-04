@@ -2,13 +2,23 @@ mod preview;
 
 use crate::metadata::{MetadataStore, RowStorageMode};
 use crate::models::{ColumnDef, ConnectionParams, IndexDef};
+use crate::schema_cache::SchemaCache;
 use base64::Engine;
 use redis::cluster::ClusterClient;
 use redis::ConnectionLike;
-use redis::{Connection, Value as RedisValue};
+use redis::{transaction, ToRedisArgs};
+use redis::{Connection, Pipeline, Value as RedisValue};
+
+use redis::sentinel::{Sentinel, SentinelNodeConnectionInfo};
+use redis::RedisConnectionInfo;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::time::Duration;
+
+/// One stream entry: (`entry_id`, field-value pairs).
+pub type StreamEntry = (String, Vec<(String, String)>);
+/// List of stream entries from XRANGE.
+pub type StreamEntries = Vec<StreamEntry>;
 
 /// Abstraction over single-node and cluster connections so all commands go through `ConnectionLike`.
 #[allow(clippy::large_enum_variant)]
@@ -124,9 +134,183 @@ fn connection_string(params: &ConnectionParams) -> String {
     format!("{scheme}://{auth}{host}:{port}/{db}")
 }
 
+/// Returns a URL safe for logging: auth (user:password) is replaced with ***.
+fn redact_url_for_log(url: &str) -> String {
+    let rest = url
+        .strip_prefix("redis://")
+        .or_else(|| url.strip_prefix("rediss://"));
+    let Some(rest) = rest else {
+        return "redis(s)://***".to_string();
+    };
+    let (scheme, suffix) = if url.starts_with("rediss://") {
+        ("rediss", rest)
+    } else {
+        ("redis", rest)
+    };
+    suffix.find('@').map_or_else(
+        || format!("{scheme}://{suffix}"),
+        |after_at| format!("{scheme}://***@{}", &suffix[after_at + 1..]),
+    )
+}
+
 pub struct RedisClient {
     conn: RedisConn,
     has_redis_json: bool,
+    schema_cache: SchemaCache,
+}
+
+/// Metadata store that caches column definitions and PK with TTL; invalidates on DDL.
+pub struct MetadataStoreWithCache<'a> {
+    conn: &'a mut RedisConn,
+    cache: &'a mut SchemaCache,
+}
+
+impl MetadataStoreWithCache<'_> {
+    const fn store(&mut self) -> MetadataStore<'_, RedisConn> {
+        MetadataStore::new(self.conn)
+    }
+
+    pub fn list_tables(&mut self) -> Result<Vec<String>, String> {
+        self.store().list_tables()
+    }
+
+    pub fn get_table_columns(&mut self, table: &str) -> Result<Option<Vec<ColumnDef>>, String> {
+        if let Some(cols) = self.cache.get_columns(table) {
+            return Ok(Some(cols));
+        }
+        let result = self.store().get_table_columns(table)?;
+        if let Some(ref cols) = result {
+            self.cache.set_columns(table, cols.clone());
+        }
+        Ok(result)
+    }
+
+    pub fn get_table_pk(&mut self, table: &str) -> Result<Option<String>, String> {
+        if let Some(pk) = self.cache.get_pk(table) {
+            return Ok(Some(pk));
+        }
+        let result = self.store().get_table_pk(table)?;
+        if let Some(ref pk) = result {
+            self.cache.set_pk(table, pk.clone());
+        }
+        Ok(result)
+    }
+
+    pub fn get_table_mode(&mut self, table: &str) -> Result<RowStorageMode, String> {
+        self.store().get_table_mode(table)
+    }
+
+    pub fn get_table_indexes(&mut self, table: &str) -> Result<Vec<IndexDef>, String> {
+        self.store().get_table_indexes(table)
+    }
+
+    pub fn set_table_indexes(&mut self, table: &str, indexes: &[IndexDef]) -> Result<(), String> {
+        self.store().set_table_indexes(table, indexes)
+    }
+
+    pub fn register_table(
+        &mut self,
+        table: &str,
+        pk_column: &str,
+        columns: &[ColumnDef],
+        mode: RowStorageMode,
+    ) -> Result<(), String> {
+        self.cache.invalidate_table(table);
+        self.store().register_table(table, pk_column, columns, mode)
+    }
+
+    #[allow(dead_code)]
+    pub fn scan_row_keys(
+        &mut self,
+        table: &str,
+        cursor: u64,
+        count: usize,
+    ) -> Result<(u64, Vec<String>), String> {
+        self.store().scan_row_keys(table, cursor, count)
+    }
+
+    pub fn list_row_keys(&mut self, table: &str) -> Result<Vec<String>, String> {
+        self.store().list_row_keys(table)
+    }
+
+    pub fn list_row_keys_paged(
+        &mut self,
+        table: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<String>, bool), String> {
+        self.store().list_row_keys_paged(table, offset, limit)
+    }
+
+    pub fn get_row_hash(
+        &mut self,
+        table: &str,
+        pk: &str,
+    ) -> Result<Option<HashMap<String, String>>, String> {
+        self.store().get_row_hash(table, pk)
+    }
+
+    pub fn set_row_hash(
+        &mut self,
+        table: &str,
+        pk: &str,
+        fields: &HashMap<String, String>,
+    ) -> Result<(), String> {
+        self.store().set_row_hash(table, pk, fields)
+    }
+
+    pub fn set_rows_hash_batch(
+        &mut self,
+        table: &str,
+        rows: &[(String, HashMap<String, String>)],
+    ) -> Result<(), String> {
+        self.store().set_rows_hash_batch(table, rows)
+    }
+
+    pub fn get_rows_hash_batch(
+        &mut self,
+        table: &str,
+        pks: &[String],
+    ) -> Result<Vec<HashMap<String, String>>, String> {
+        self.store().get_rows_hash_batch(table, pks)
+    }
+
+    pub fn get_row_json(&mut self, table: &str, pk: &str) -> Result<Option<JsonValue>, String> {
+        self.store().get_row_json(table, pk)
+    }
+
+    pub fn set_row_json(&mut self, table: &str, pk: &str, value: &JsonValue) -> Result<(), String> {
+        self.store().set_row_json(table, pk, value)
+    }
+
+    pub fn set_rows_json_batch(
+        &mut self,
+        table: &str,
+        rows: &[(String, String)],
+    ) -> Result<(), String> {
+        self.store().set_rows_json_batch(table, rows)
+    }
+
+    pub fn get_rows_json_batch(
+        &mut self,
+        table: &str,
+        pks: &[String],
+    ) -> Result<Vec<Option<JsonValue>>, String> {
+        self.store().get_rows_json_batch(table, pks)
+    }
+
+    pub fn delete_row(&mut self, table: &str, pk: &str) -> Result<(), String> {
+        self.store().delete_row(table, pk)
+    }
+
+    pub fn delete_rows_batch(&mut self, table: &str, pks: &[String]) -> Result<u64, String> {
+        self.store().delete_rows_batch(table, pks)
+    }
+
+    pub fn drop_table(&mut self, table: &str) -> Result<(), String> {
+        self.cache.invalidate_table(table);
+        self.store().drop_table(table)
+    }
 }
 
 impl RedisClient {
@@ -149,20 +333,67 @@ impl RedisClient {
                 );
             }
             log::debug!("Connecting via Sentinel master={master}");
-            return Err("Redis Sentinel is not yet supported".to_string());
+            let node_urls: Vec<String> = sentinel_nodes
+                .iter()
+                .map(|s| {
+                    let t = s.trim();
+                    if t.starts_with("redis://") || t.starts_with("rediss://") {
+                        t.to_string()
+                    } else {
+                        format!("redis://{t}")
+                    }
+                })
+                .collect();
+            let mut sentinel = Sentinel::build(node_urls).map_err(|e| e.to_string())?;
+            let db = params
+                .database
+                .as_ref()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            let mut redis_info = RedisConnectionInfo::default().set_db(db);
+            if let Some(u) = params.username.as_deref().filter(|x| !x.is_empty()) {
+                redis_info = redis_info.set_username(u);
+            }
+            if let Some(p) = params.password.as_deref().filter(|x| !x.is_empty()) {
+                redis_info = redis_info.set_password(p);
+            }
+            let mut node_info =
+                SentinelNodeConnectionInfo::default().set_redis_connection_info(redis_info);
+            if params.use_tls() {
+                node_info = node_info.set_tls_mode(redis::TlsMode::Secure);
+            }
+            let master_client = sentinel
+                .master_for(master, Some(&node_info))
+                .map_err(|e| e.to_string())?;
+            let connect_timeout = Duration::from_millis(params.connect_timeout_ms.unwrap_or(5000));
+            let single_conn = master_client
+                .get_connection_with_timeout(connect_timeout)
+                .map_err(|e| e.to_string())?;
+            let read_ms = params.read_timeout_ms.unwrap_or(10000);
+            if let Err(e) = single_conn.set_read_timeout(Some(Duration::from_millis(read_ms))) {
+                log::warn!("Failed to set read timeout ({read_ms} ms): {e}");
+            }
+            let write_ms = params.write_timeout_ms.unwrap_or(10000);
+            if let Err(e) = single_conn.set_write_timeout(Some(Duration::from_millis(write_ms))) {
+                log::warn!("Failed to set write timeout ({write_ms} ms): {e}");
+            }
+            log::info!("Redis connection established via Sentinel (master={master})");
+            RedisConn::Single(single_conn)
         } else {
             let url = connection_string(params);
-            log::debug!("Connecting to Redis at {url}");
+            log::debug!("Connecting to Redis at {}", redact_url_for_log(&url));
             let client = redis::Client::open(url.as_str()).map_err(|e| e.to_string())?;
             let connect_timeout = Duration::from_millis(params.connect_timeout_ms.unwrap_or(5000));
             let single_conn = client
                 .get_connection_with_timeout(connect_timeout)
                 .map_err(|e| e.to_string())?;
-            if let Some(ms) = params.read_timeout_ms.or(Some(10000)) {
-                let _ = single_conn.set_read_timeout(Some(Duration::from_millis(ms)));
+            let read_ms = params.read_timeout_ms.unwrap_or(10000);
+            if let Err(e) = single_conn.set_read_timeout(Some(Duration::from_millis(read_ms))) {
+                log::warn!("Failed to set read timeout ({read_ms} ms): {e}");
             }
-            if let Some(ms) = params.write_timeout_ms.or(Some(10000)) {
-                let _ = single_conn.set_write_timeout(Some(Duration::from_millis(ms)));
+            let write_ms = params.write_timeout_ms.unwrap_or(10000);
+            if let Err(e) = single_conn.set_write_timeout(Some(Duration::from_millis(write_ms))) {
+                log::warn!("Failed to set write timeout ({write_ms} ms): {e}");
             }
             log::info!("Redis connection established");
             RedisConn::Single(single_conn)
@@ -173,6 +404,7 @@ impl RedisClient {
         Ok(Self {
             conn,
             has_redis_json,
+            schema_cache: SchemaCache::with_default_ttl(),
         })
     }
 
@@ -191,6 +423,11 @@ impl RedisClient {
             .map_err(|e| e.to_string())
     }
 
+    /// Returns true if the connection is still open (no round-trip).
+    pub fn is_open(&self) -> bool {
+        self.conn.is_open()
+    }
+
     pub fn list_databases(&mut self) -> Result<Vec<String>, String> {
         let raw: Vec<String> = redis::cmd("CONFIG")
             .arg("GET")
@@ -207,16 +444,12 @@ impl RedisClient {
         self.has_redis_json
     }
 
-    pub fn list_tables(&mut self) -> Result<Vec<String>, String> {
-        MetadataStore::new(&mut self.conn).list_tables()
-    }
-
-    pub fn get_table_columns(&mut self, table: &str) -> Result<Option<Vec<ColumnDef>>, String> {
-        MetadataStore::new(&mut self.conn).get_table_columns(table)
-    }
-
-    pub fn get_table_pk(&mut self, table: &str) -> Result<Option<String>, String> {
-        MetadataStore::new(&mut self.conn).get_table_pk(table)
+    /// Access the metadata store for table/row operations. Columns and PK are cached with TTL; invalidated on DDL.
+    pub const fn metadata(&mut self) -> MetadataStoreWithCache<'_> {
+        MetadataStoreWithCache {
+            conn: &mut self.conn,
+            cache: &mut self.schema_cache,
+        }
     }
 
     /// Primary key for a table: from metadata, or "key" for virtual keys tables, or "_key" when table has row data but no metadata.
@@ -230,10 +463,10 @@ impl RedisClient {
         if table.starts_with("__keys") && table != "__redis_keys__" {
             return Ok(Some("key".to_string()));
         }
-        if let Some(pk) = self.get_table_pk(table)? {
+        if let Some(pk) = self.metadata().get_table_pk(table)? {
             return Ok(Some(pk));
         }
-        let keys = self.list_row_keys(table)?;
+        let keys = self.metadata().list_row_keys(table)?;
         if keys.is_empty() {
             return Ok(None);
         }
@@ -245,7 +478,7 @@ impl RedisClient {
         &mut self,
         table: &str,
     ) -> Result<Option<Vec<ColumnDef>>, String> {
-        let keys = self.list_row_keys(table)?;
+        let keys = self.metadata().list_row_keys(table)?;
         let first_pk = match keys.first() {
             Some(pk) => pk.as_str(),
             None => return Ok(None),
@@ -259,7 +492,7 @@ impl RedisClient {
             is_auto_increment: false,
             comment: None,
         };
-        if let Ok(Some(map)) = self.get_row_hash(table, first_pk) {
+        if let Ok(Some(map)) = self.metadata().get_row_hash(table, first_pk) {
             let mut names: Vec<String> = map.keys().cloned().collect();
             names.sort();
             let mut cols = vec![key_col];
@@ -280,7 +513,7 @@ impl RedisClient {
             );
             return Ok(Some(cols));
         }
-        if let Ok(Some(JsonValue::Object(obj))) = self.get_row_json(table, first_pk) {
+        if let Ok(Some(JsonValue::Object(obj))) = self.metadata().get_row_json(table, first_pk) {
             let mut names: Vec<String> = obj.keys().cloned().collect();
             names.sort();
             let mut cols = vec![key_col];
@@ -304,85 +537,16 @@ impl RedisClient {
         Ok(Some(vec![key_col]))
     }
 
-    pub fn get_table_mode(&mut self, table: &str) -> Result<RowStorageMode, String> {
-        MetadataStore::new(&mut self.conn).get_table_mode(table)
-    }
-
-    pub fn register_table(
-        &mut self,
-        table: &str,
-        pk_column: &str,
-        columns: &[ColumnDef],
-        mode: &str,
-    ) -> Result<(), String> {
-        let normalized_mode = RowStorageMode::from_str(mode);
-        MetadataStore::new(&mut self.conn).register_table(
-            table,
-            pk_column,
-            columns,
-            normalized_mode,
-        )
-    }
-
-    pub fn list_row_keys(&mut self, table: &str) -> Result<Vec<String>, String> {
-        MetadataStore::new(&mut self.conn).list_row_keys(table)
-    }
-
-    /// Page of row keys without loading the full set. Use when only a slice is needed (e.g. simple pagination).
-    pub fn list_row_keys_paged(
-        &mut self,
-        table: &str,
-        offset: usize,
-        limit: usize,
-    ) -> Result<(Vec<String>, bool), String> {
-        MetadataStore::new(&mut self.conn).list_row_keys_paged(table, offset, limit)
-    }
-
-    pub fn get_row_hash(
-        &mut self,
-        table: &str,
-        pk: &str,
-    ) -> Result<Option<HashMap<String, String>>, String> {
-        MetadataStore::new(&mut self.conn).get_row_hash(table, pk)
-    }
-
-    pub fn set_row_hash(
-        &mut self,
-        table: &str,
-        pk: &str,
-        fields: &HashMap<String, String>,
-    ) -> Result<(), String> {
-        MetadataStore::new(&mut self.conn).set_row_hash(table, pk, fields)
-    }
-
-    pub fn get_row_json(&mut self, table: &str, pk: &str) -> Result<Option<JsonValue>, String> {
-        MetadataStore::new(&mut self.conn).get_row_json(table, pk)
-    }
-
-    pub fn set_row_json(&mut self, table: &str, pk: &str, value: &JsonValue) -> Result<(), String> {
-        MetadataStore::new(&mut self.conn).set_row_json(table, pk, value)
-    }
-
-    pub fn delete_row(&mut self, table: &str, pk: &str) -> Result<(), String> {
-        MetadataStore::new(&mut self.conn).delete_row(table, pk)
-    }
-
-    /// Delete multiple rows in chunked pipelines. Returns the number of rows deleted.
-    pub fn delete_rows_batch(&mut self, table: &str, pks: &[String]) -> Result<u64, String> {
-        MetadataStore::new(&mut self.conn).delete_rows_batch(table, pks)
-    }
-
-    /// Remove a registered table and all its data and metadata. Fails if the table is not in the registry.
-    pub fn drop_table(&mut self, table: &str) -> Result<(), String> {
-        MetadataStore::new(&mut self.conn).drop_table(table)
-    }
-
-    pub fn get_table_indexes(&mut self, table: &str) -> Result<Vec<IndexDef>, String> {
-        MetadataStore::new(&mut self.conn).get_table_indexes(table)
-    }
-
-    pub fn set_table_indexes(&mut self, table: &str, indexes: &[IndexDef]) -> Result<(), String> {
-        MetadataStore::new(&mut self.conn).set_table_indexes(table, indexes)
+    /// Run a transaction with optional WATCH on keys. The closure receives the connection and an
+    /// atomic pipeline (MULTI/EXEC). Return Ok(Some(t)) to commit and return t, Ok(None) to retry.
+    /// Cluster connections may have limited support for WATCH.
+    #[allow(dead_code)]
+    pub fn run_transaction<K, F, T>(&mut self, watch_keys: &[K], mut f: F) -> Result<T, String>
+    where
+        K: ToRedisArgs,
+        F: FnMut(&mut RedisConn, &mut Pipeline) -> redis::RedisResult<Option<T>>,
+    {
+        transaction(&mut self.conn, watch_keys, &mut f).map_err(|e| e.to_string())
     }
 
     /// Delete a key by name (raw Redis DEL). Use for virtual key table CRUD.
@@ -564,6 +728,285 @@ impl RedisClient {
             .map_err(|e| e.to_string())
     }
 
+    /// HGETALL for a single key. Returns field-value pairs in iteration order. Uses lossy UTF-8 so binary data is displayable.
+    pub fn hgetall(&mut self, key: &[u8]) -> Result<Vec<(String, String)>, String> {
+        let raw: Vec<Vec<u8>> = redis::cmd("HGETALL")
+            .arg(key)
+            .query(&mut self.conn)
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::with_capacity(raw.len() / 2);
+        for chunk in raw.chunks(2) {
+            if chunk.len() >= 2 {
+                out.push((
+                    String::from_utf8_lossy(&chunk[0]).into_owned(),
+                    String::from_utf8_lossy(&chunk[1]).into_owned(),
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// LRANGE key 0 -1. Returns all list elements.
+    pub fn lrange_all(&mut self, key: &[u8]) -> Result<Vec<String>, String> {
+        let raw: Vec<Vec<u8>> = redis::cmd("LRANGE")
+            .arg(key)
+            .arg(0i32)
+            .arg(-1i32)
+            .query(&mut self.conn)
+            .map_err(|e| e.to_string())?;
+        Ok(raw
+            .into_iter()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .collect())
+    }
+
+    /// SMEMBERS for a single key. Returns all set members.
+    pub fn smembers(&mut self, key: &[u8]) -> Result<Vec<String>, String> {
+        let raw: Vec<Vec<u8>> = redis::cmd("SMEMBERS")
+            .arg(key)
+            .query(&mut self.conn)
+            .map_err(|e| e.to_string())?;
+        Ok(raw
+            .into_iter()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .collect())
+    }
+
+    /// ZRANGE key 0 -1 WITHSCORES. Returns (member, score) pairs.
+    pub fn zrange_with_scores(&mut self, key: &[u8]) -> Result<Vec<(String, f64)>, String> {
+        let raw: Vec<RedisValue> = redis::cmd("ZRANGE")
+            .arg(key)
+            .arg(0i32)
+            .arg(-1i32)
+            .arg("WITHSCORES")
+            .query(&mut self.conn)
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::with_capacity(raw.len() / 2);
+        let mut i = 0;
+        while i + 1 < raw.len() {
+            let member = match &raw[i] {
+                RedisValue::BulkString(b) => String::from_utf8_lossy(b).into_owned(),
+                RedisValue::SimpleString(s) => s.clone(),
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            let score = match &raw[i + 1] {
+                RedisValue::BulkString(b) => {
+                    String::from_utf8_lossy(b).parse::<f64>().unwrap_or(0.0)
+                }
+                RedisValue::SimpleString(s) => s.parse::<f64>().unwrap_or(0.0),
+                RedisValue::Int(n) => {
+                    #[allow(clippy::cast_precision_loss)]
+                    let s = *n as f64;
+                    s
+                }
+                RedisValue::Double(d) => *d,
+                _ => 0.0,
+            };
+            out.push((member, score));
+            i += 2;
+        }
+        Ok(out)
+    }
+
+    /// XRANGE key - +. Returns (`entry_id`, field-value pairs) for each stream entry.
+    pub fn xrange_all(&mut self, key: &[u8]) -> Result<StreamEntries, String> {
+        let raw: Vec<RedisValue> = redis::cmd("XRANGE")
+            .arg(key)
+            .arg("-")
+            .arg("+")
+            .query(&mut self.conn)
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for entry in raw {
+            let RedisValue::Array(ref items) = entry else {
+                continue;
+            };
+            if items.len() < 2 {
+                continue;
+            }
+            let id = match &items[0] {
+                RedisValue::BulkString(b) => String::from_utf8_lossy(b).into_owned(),
+                RedisValue::SimpleString(s) => s.clone(),
+                _ => continue,
+            };
+            let RedisValue::Array(ref field_list) = items[1] else {
+                continue;
+            };
+            let mut fields = Vec::new();
+            let mut j = 0;
+            while j + 1 < field_list.len() {
+                let f = match &field_list[j] {
+                    RedisValue::BulkString(b) => String::from_utf8_lossy(b).into_owned(),
+                    RedisValue::SimpleString(s) => s.clone(),
+                    _ => {
+                        j += 1;
+                        continue;
+                    }
+                };
+                let v = match &field_list[j + 1] {
+                    RedisValue::BulkString(b) => String::from_utf8_lossy(b).into_owned(),
+                    RedisValue::SimpleString(s) => s.clone(),
+                    _ => String::new(),
+                };
+                fields.push((f, v));
+                j += 2;
+            }
+            out.push((id, fields));
+        }
+        Ok(out)
+    }
+
+    /// Pipeline HGETALL for multiple keys. Returns one Vec<(String,String)> per key (field-value pairs). Uses lossy UTF-8 for binary data.
+    pub fn hgetall_batch(&mut self, keys: &[&[u8]]) -> Result<Vec<Vec<(String, String)>>, String> {
+        const CHUNK: usize = 100;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(CHUNK) {
+            let mut pipe = redis::pipe();
+            for k in chunk {
+                pipe.cmd("HGETALL").arg(*k);
+            }
+            let raw_list: Vec<Vec<Vec<u8>>> =
+                pipe.query(&mut self.conn).map_err(|e| e.to_string())?;
+            for raw in raw_list {
+                let mut pairs = Vec::with_capacity(raw.len() / 2);
+                for c in raw.chunks(2) {
+                    if c.len() >= 2 {
+                        pairs.push((
+                            String::from_utf8_lossy(&c[0]).into_owned(),
+                            String::from_utf8_lossy(&c[1]).into_owned(),
+                        ));
+                    }
+                }
+                out.push(pairs);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Pipeline LRANGE key 0 -1 for multiple keys.
+    pub fn lrange_all_batch(&mut self, keys: &[&[u8]]) -> Result<Vec<Vec<String>>, String> {
+        const CHUNK: usize = 100;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(CHUNK) {
+            let mut pipe = redis::pipe();
+            for k in chunk {
+                pipe.cmd("LRANGE").arg(*k).arg(0i32).arg(-1i32);
+            }
+            let raw_list: Vec<Vec<Vec<u8>>> =
+                pipe.query(&mut self.conn).map_err(|e| e.to_string())?;
+            for raw in raw_list {
+                out.push(
+                    raw.into_iter()
+                        .map(|b| String::from_utf8_lossy(&b).into_owned())
+                        .collect(),
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// Pipeline SMEMBERS for multiple keys.
+    pub fn smembers_batch(&mut self, keys: &[&[u8]]) -> Result<Vec<Vec<String>>, String> {
+        const CHUNK: usize = 100;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(CHUNK) {
+            let mut pipe = redis::pipe();
+            for k in chunk {
+                pipe.cmd("SMEMBERS").arg(*k);
+            }
+            let raw_list: Vec<Vec<Vec<u8>>> =
+                pipe.query(&mut self.conn).map_err(|e| e.to_string())?;
+            for raw in raw_list {
+                out.push(
+                    raw.into_iter()
+                        .map(|b| String::from_utf8_lossy(&b).into_owned())
+                        .collect(),
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// Pipeline ZRANGE key 0 -1 WITHSCORES for multiple keys.
+    pub fn zrange_with_scores_batch(
+        &mut self,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Vec<(String, f64)>>, String> {
+        const CHUNK: usize = 50;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(CHUNK) {
+            let mut pipe = redis::pipe();
+            for k in chunk {
+                pipe.cmd("ZRANGE")
+                    .arg(*k)
+                    .arg(0i32)
+                    .arg(-1i32)
+                    .arg("WITHSCORES");
+            }
+            let raw_list: Vec<Vec<RedisValue>> =
+                pipe.query(&mut self.conn).map_err(|e| e.to_string())?;
+            for raw in raw_list {
+                let mut pairs = Vec::new();
+                let mut i = 0;
+                while i + 1 < raw.len() {
+                    let member = match &raw[i] {
+                        RedisValue::BulkString(b) => String::from_utf8_lossy(b).into_owned(),
+                        RedisValue::SimpleString(s) => s.clone(),
+                        _ => {
+                            i += 1;
+                            continue;
+                        }
+                    };
+                    let score = match &raw[i + 1] {
+                        RedisValue::BulkString(b) => {
+                            String::from_utf8_lossy(b).parse::<f64>().unwrap_or(0.0)
+                        }
+                        RedisValue::SimpleString(s) => s.parse::<f64>().unwrap_or(0.0),
+                        RedisValue::Int(n) => {
+                            #[allow(clippy::cast_precision_loss)]
+                            let s = *n as f64;
+                            s
+                        }
+                        RedisValue::Double(d) => *d,
+                        _ => 0.0,
+                    };
+                    pairs.push((member, score));
+                    i += 2;
+                }
+                out.push(pairs);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Pipeline XRANGE key - + for multiple keys.
+    pub fn xrange_all_batch(&mut self, keys: &[&[u8]]) -> Result<Vec<StreamEntries>, String> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let entries = self.xrange_all(key)?;
+            out.push(entries);
+        }
+        Ok(out)
+    }
+
     /// Number of keys in the current database (DBSIZE).
     pub fn dbsize(&mut self) -> Result<u64, String> {
         redis::cmd("DBSIZE")
@@ -704,7 +1147,7 @@ impl RedisClient {
     /// Value preview only (types already known). Use after `key_types_batch` when filtering/sorting by type.
     pub fn key_value_preview_batch(
         &mut self,
-        keys: &[&Vec<u8>],
+        keys: &[&[u8]],
         types: &[String],
         json_path: Option<&str>,
     ) -> Result<Vec<String>, String> {
@@ -740,7 +1183,7 @@ impl RedisClient {
     /// Batch (type, `value_preview`) for many keys using pipelining. Same semantics as `key_type_and_preview` per key.
     pub fn key_type_and_preview_batch(
         &mut self,
-        keys: &[&Vec<u8>],
+        keys: &[&[u8]],
         json_path: Option<&str>,
     ) -> Result<Vec<(String, String)>, String> {
         preview::key_type_and_preview_batch(&mut self.conn, self.has_redis_json, keys, json_path)

@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value as JsonValue};
 
@@ -611,6 +611,20 @@ fn main() {
         }),
         "execute_query virtual __keys_stress__ WHERE after delete",
     ));
+    requests.push((
+        json!({
+            "jsonrpc": "2.0",
+            "method": "execute_query",
+            "params": {
+                "params": params,
+                "query": "SELECT * FROM __redis_keys__ WHERE key LIKE 'batch%' AND type = 'string' LIMIT 5",
+                "page": 1,
+                "page_size": 10
+            },
+            "id": 439
+        }),
+        "execute_query virtual WHERE AND",
+    ));
 
     for (req, method) in requests {
         let req_str = serde_json::to_string(&req).unwrap() + "\n";
@@ -830,6 +844,17 @@ fn main() {
                         "__redis_keys__ query should respect page_size upper bound"
                     );
                 }
+                "execute_query virtual WHERE AND" => {
+                    let cols = result
+                        .get("columns")
+                        .and_then(|c| c.as_array())
+                        .expect("columns");
+                    assert!(
+                        cols.iter().filter_map(|c| c.as_str()).any(|x| x == "key"),
+                        "WHERE AND query should return key column"
+                    );
+                    let _rows = result.get("rows").and_then(|v| v.as_array()).expect("rows");
+                }
                 "execute_query CREATE INDEX" => {
                     assert!(
                         result.is_object(),
@@ -1027,6 +1052,80 @@ fn main() {
                 _ => {}
             }
         }
+    }
+
+    if std::env::var("TABULARIS_PLUGIN_PERF").as_deref() == Ok("1") {
+        let perf_requests: Vec<(JsonValue, &str)> = vec![
+            (
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "execute_query",
+                    "params": {
+                        "params": params,
+                        "query": "SELECT * FROM \"__redis_keys__\"",
+                        "page": 1,
+                        "limit": 500
+                    },
+                    "id": 5001
+                }),
+                "__redis_keys__ page1",
+            ),
+            (
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "execute_query",
+                    "params": {
+                        "params": params,
+                        "query": "SELECT * FROM \"__redis_keys__\"",
+                        "page": 2,
+                        "limit": 500
+                    },
+                    "id": 5002
+                }),
+                "__redis_keys__ page2",
+            ),
+            (
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "execute_query",
+                    "params": {
+                        "params": params,
+                        "query": "SELECT * FROM \"__keys_batch__\"",
+                        "page": 1,
+                        "limit": 500
+                    },
+                    "id": 5003
+                }),
+                "__keys_batch__ page1",
+            ),
+            (
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "execute_query",
+                    "params": {
+                        "params": params,
+                        "query": "SELECT * FROM __redis_keys__ WHERE type = 'string' ORDER BY value ASC LIMIT 100",
+                        "page": 1,
+                        "limit": 100
+                    },
+                    "id": 5004
+                }),
+                "filter type order by value",
+            ),
+        ];
+        eprintln!("PERF_BASELINE virtual key and pagination timings (ms):");
+        for (req, label) in perf_requests {
+            let start = Instant::now();
+            let req_str = serde_json::to_string(&req).unwrap() + "\n";
+            stdin.write_all(req_str.as_bytes()).unwrap();
+            stdin.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            if read_response(&mut reader).is_some() {
+                let elapsed = start.elapsed().as_millis();
+                eprintln!("  {label}: {elapsed} ms");
+            }
+        }
+        eprintln!("PERF_BASELINE end (RSS: measure with time -v or external tool)");
     }
 
     publish_test_message(&pubsub_channel, "shutdown");

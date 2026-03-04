@@ -300,6 +300,57 @@ impl<'a, C: ConnectionLike> MetadataStore<'a, C> {
         Ok(())
     }
 
+    /// Insert multiple hash rows in a single pipeline. Keys set is updated for each pk.
+    pub fn set_rows_hash_batch(
+        &mut self,
+        table: &str,
+        rows: &[(String, HashMap<String, String>)],
+    ) -> Result<(), String> {
+        const CHUNK: usize = 200;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let keys_key = Self::data_keys_set(table);
+        for chunk in rows.chunks(CHUNK) {
+            let mut pipe = redis::pipe();
+            for (pk, fields) in chunk {
+                let key = Self::data_key(table, pk);
+                pipe.cmd("HSET").arg(&key);
+                for (k, v) in fields {
+                    pipe.arg(k).arg(v);
+                }
+                pipe.ignore();
+                pipe.cmd("SADD").arg(&keys_key).arg(pk).ignore();
+            }
+            pipe.query::<()>(self.conn).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Fetch multiple hash rows in pipelined chunks. Returns one `HashMap` per pk; empty map if key missing or empty.
+    pub fn get_rows_hash_batch(
+        &mut self,
+        table: &str,
+        pks: &[String],
+    ) -> Result<Vec<HashMap<String, String>>, String> {
+        const CHUNK: usize = 200;
+        if pks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(pks.len());
+        for chunk in pks.chunks(CHUNK) {
+            let mut pipe = redis::pipe();
+            for pk in chunk {
+                let key = Self::data_key(table, pk);
+                pipe.cmd("HGETALL").arg(&key);
+            }
+            let chunk_results: Vec<HashMap<String, String>> =
+                pipe.query(self.conn).map_err(|e| e.to_string())?;
+            out.extend(chunk_results);
+        }
+        Ok(out)
+    }
+
     pub fn get_row_json(&mut self, table: &str, pk: &str) -> Result<Option<JsonValue>, String> {
         let key = Self::data_key(table, pk);
         let raw: Option<String> = redis::cmd("JSON.GET")
@@ -333,6 +384,66 @@ impl<'a, C: ConnectionLike> MetadataStore<'a, C> {
             .map_err(|e| e.to_string())?;
 
         Ok(())
+    }
+
+    /// Insert multiple JSON rows in a single pipeline. Keys set is updated for each pk.
+    pub fn set_rows_json_batch(
+        &mut self,
+        table: &str,
+        rows: &[(String, String)],
+    ) -> Result<(), String> {
+        const CHUNK: usize = 200;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let keys_key = Self::data_keys_set(table);
+        for chunk in rows.chunks(CHUNK) {
+            let mut pipe = redis::pipe();
+            for (pk, payload) in chunk {
+                let key = Self::data_key(table, pk);
+                pipe.cmd("JSON.SET")
+                    .arg(&key)
+                    .arg("$")
+                    .arg(payload)
+                    .ignore();
+                pipe.cmd("SADD").arg(&keys_key).arg(pk).ignore();
+            }
+            pipe.query::<()>(self.conn).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Fetch multiple JSON rows in pipelined chunks. Returns one Option<JsonValue> per pk; None if key missing or not JSON.
+    pub fn get_rows_json_batch(
+        &mut self,
+        table: &str,
+        pks: &[String],
+    ) -> Result<Vec<Option<JsonValue>>, String> {
+        const CHUNK: usize = 200;
+        if pks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(pks.len());
+        for chunk in pks.chunks(CHUNK) {
+            let mut pipe = redis::pipe();
+            for pk in chunk {
+                let key = Self::data_key(table, pk);
+                pipe.cmd("JSON.GET").arg(&key).arg("$");
+            }
+            let raw_list: Vec<Option<String>> = pipe.query(self.conn).map_err(|e| e.to_string())?;
+            for raw in raw_list {
+                let opt = match raw {
+                    Some(serialized) => {
+                        let arr: Vec<JsonValue> =
+                            serde_json::from_str(&serialized).map_err(|e| e.to_string())?;
+                        arr.into_iter().next()
+                    }
+                    None => None,
+                };
+                out.push(opt);
+            }
+        }
+        Ok(out)
     }
 
     pub fn delete_row(&mut self, table: &str, pk: &str) -> Result<(), String> {

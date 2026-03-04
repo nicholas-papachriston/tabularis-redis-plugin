@@ -1,4 +1,7 @@
-use crate::methods::common::{column_def_to_api_json, redis_virtual_columns_json};
+use crate::methods::common::{
+    column_def_to_api_json, redis_virtual_columns_json, type_virtual_columns_json, HASHES_TABLE,
+    LISTS_TABLE, SETS_TABLE, STREAMS_TABLE, ZSETS_TABLE,
+};
 use crate::redis_client::RedisClient;
 use serde_json::Value as JsonValue;
 
@@ -80,6 +83,32 @@ pub fn virtual_table_scan_target(table: &str) -> Option<VirtualScanTarget> {
     target
 }
 
+/// Type-specific virtual tables: hashes, lists, sets, zsets, streams.
+pub fn is_type_virtual_table(name: &str) -> bool {
+    type_virtual_columns_json(name).is_some()
+}
+
+/// Redis TYPE string for a type-specific virtual table, or None if not a type table.
+pub fn type_virtual_table_redis_type(name: &str) -> Option<&'static str> {
+    let t = name.trim().trim_matches('"');
+    match t {
+        HASHES_TABLE => Some("hash"),
+        LISTS_TABLE => Some("list"),
+        SETS_TABLE => Some("set"),
+        ZSETS_TABLE => Some("zset"),
+        STREAMS_TABLE => Some("stream"),
+        _ => None,
+    }
+}
+
+const TYPE_VIRTUAL_TABLES: &[(&str, &str)] = &[
+    (HASHES_TABLE, "All fields in hash keys"),
+    (LISTS_TABLE, "All elements in list keys"),
+    (SETS_TABLE, "All members in set keys"),
+    (ZSETS_TABLE, "All members in sorted set keys"),
+    (STREAMS_TABLE, "All entries in stream keys"),
+];
+
 pub fn test_connection(client: &mut RedisClient) -> Result<JsonValue, String> {
     log::debug!("test_connection: pinging Redis");
     client.ping()?;
@@ -103,9 +132,14 @@ pub fn list_table_names(
     client: &mut RedisClient,
     _schema: Option<&str>,
 ) -> Result<Vec<String>, String> {
-    let mut names = client.list_tables()?;
+    let mut names = client.metadata().list_tables()?;
     if !names.contains(&REDIS_KEYS_TABLE.to_string()) {
         names.push(REDIS_KEYS_TABLE.to_string());
+    }
+    for (table_name, _) in TYPE_VIRTUAL_TABLES {
+        if !names.contains(&(*table_name).to_string()) {
+            names.push((*table_name).to_string());
+        }
     }
     let prefixes = client.scan_key_prefixes(500)?;
     for prefix in prefixes {
@@ -126,13 +160,21 @@ pub fn get_tables(client: &mut RedisClient, schema: Option<&str>) -> Result<Json
     log::debug!("get_tables: listing tables");
     let names = list_table_names(client, schema)?;
     log::info!("get_tables: found {} table(s)", names.len());
+    let comment_for: std::collections::HashMap<String, String> = TYPE_VIRTUAL_TABLES
+        .iter()
+        .map(|(n, c)| ((*n).to_string(), (*c).to_string()))
+        .collect();
     let tables: Vec<JsonValue> = names
         .into_iter()
         .map(|name| {
+            let comment = comment_for
+                .get(&name)
+                .cloned()
+                .map_or(JsonValue::Null, JsonValue::String);
             serde_json::json!({
                 "name": name,
                 "schema": serde_json::Value::Null,
-                "comment": serde_json::Value::Null
+                "comment": comment
             })
         })
         .collect();
@@ -151,7 +193,10 @@ pub fn get_columns(
     {
         return Ok(serde_json::json!(redis_virtual_columns_json()));
     }
-    let list = match client.get_table_columns(table)? {
+    if let Some(cols) = type_virtual_columns_json(table) {
+        return Ok(serde_json::json!(cols));
+    }
+    let list = match client.metadata().get_table_columns(table)? {
         Some(cols) if !cols.is_empty() => cols,
         _ => client.infer_columns_from_data(table)?.unwrap_or_default(),
     };
@@ -174,7 +219,7 @@ pub fn get_indexes(
     table: &str,
 ) -> Result<JsonValue, String> {
     log::debug!("get_indexes: table={table}");
-    let indexes = client.get_table_indexes(table)?;
+    let indexes = client.metadata().get_table_indexes(table)?;
     log::info!("get_indexes: table={table} count={}", indexes.len());
     let out: Vec<JsonValue> = indexes
         .into_iter()

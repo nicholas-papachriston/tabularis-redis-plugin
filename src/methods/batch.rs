@@ -29,7 +29,10 @@ pub fn get_schema_snapshot(
             foreign_keys.insert(name.clone(), JsonValue::Array(vec![]));
             continue;
         }
-        let cols = client.get_table_columns(name)?.unwrap_or_default();
+        let cols = client
+            .metadata()
+            .get_table_columns(name)?
+            .unwrap_or_default();
         let col_list: Vec<JsonValue> = cols.iter().map(column_def_to_api_json).collect();
         columns.insert(name.clone(), JsonValue::Array(col_list));
         foreign_keys.insert(name.clone(), JsonValue::Array(vec![]));
@@ -60,7 +63,10 @@ pub fn get_all_columns_batch(
             result.insert(name.clone(), JsonValue::Array(redis_virtual_columns_json()));
             continue;
         }
-        let cols = client.get_table_columns(name)?.unwrap_or_default();
+        let cols = client
+            .metadata()
+            .get_table_columns(name)?
+            .unwrap_or_default();
         let col_list: Vec<JsonValue> = cols.iter().map(column_def_to_api_json).collect();
         result.insert(name.clone(), JsonValue::Array(col_list));
     }

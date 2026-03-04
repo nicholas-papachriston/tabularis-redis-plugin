@@ -24,6 +24,7 @@ This plugin connects to Redis and exposes logical databases (0-15), metadata tab
 - **Metadata tables** — Tabularis metadata is stored in Redis as Hash or RedisJSON; the plugin lists these as tables and supports CRUD.
 - **`__redis_keys__`** — Virtual table that lists all keys in the current database via SCAN, with columns: key, type, value (preview), ttl_seconds, key_raw (Base64 for lossless binary key round-trip).
 - **Key-pattern virtual tables** — Top-level prefixes (e.g. `stress:*`, `batch:*`) are discovered and exposed as tables like `__keys:stress__`, so you can open a table and see only those keys without writing a WHERE clause.
+- **Type-specific virtual tables** — Tables `hashes`, `lists`, `sets`, `zsets`, and `streams` expose the contents of Redis keys by type: e.g. `SELECT * FROM hashes` lists all hash keys and their field/value pairs; `SELECT * FROM hashes WHERE key = 'mykey'` shows one hash. Binary or non-UTF-8 field/value data is displayed using lossy UTF-8 conversion so the UI never errors.
 - **Filtering and sorting** — For `__redis_keys__` and key-pattern tables: `WHERE key = 'x'` / `WHERE key LIKE 'x%'` (SCAN MATCH), `WHERE type = 'hash'` / `WHERE type != 'string'`, `ORDER BY key` / `ORDER BY type` / `ORDER BY value` ASC/DESC, and `LIMIT n`.
 - **TTL column** — Each key’s TTL is shown (-1 for no expiry, seconds remaining, or empty if key missing).
 - **Pipelined reads** — Type and value preview for the current page are fetched in batches to reduce round-trips.
@@ -33,11 +34,11 @@ This plugin connects to Redis and exposes logical databases (0-15), metadata tab
 - **Batch CRUD** — `insert_records_batch` and `delete_records_batch` reduce round-trips for bulk inserts and deletes on metadata and virtual key tables.
 - **Pub/Sub visibility** — `get_pubsub_channels` lists active channels and subscriber counts (PUBSUB CHANNELS / NUMSUB).
 - **Server stats** — `get_server_info` returns parsed Redis INFO (version, memory, clients, stats, keyspace, etc.) as structured JSON.
-- **Schema snapshot and ER** — `get_schema_snapshot` and `get_all_columns_batch` include `__redis_keys__` and key-pattern tables. If the app calls `get_all_columns_batch` without a table list, the plugin uses the full table list so the ER diagram works.
+- **Schema snapshot and ER** — `get_schema_snapshot` and `get_all_columns_batch` include `__redis_keys__`, key-pattern tables, and type-specific tables (hashes, lists, sets, zsets, streams). If the app calls `get_all_columns_batch` without a table list, the plugin uses the full table list so the ER diagram works.
 - **Execution timing** — Query results include `execution_time_ms` for diagnostics.
 - **Structured errors** — JSON-RPC errors include a `data.kind` field (e.g. INVALID_PARAMS, NOT_FOUND, BACKEND_ERROR) for programmatic handling.
 - **TLS (rustls)** — Optional TLS via `tls` / `ssl_mode`; uses `rediss://` when enabled.
-- **Connection timeouts and health** — Configurable connect/read/write timeouts; ping before reuse with automatic reconnection on failure.
+- **Connection timeouts and health** — Configurable connect/read/write timeouts; cached connections are reused when still open (no PING on every request); automatic reconnection on failure.
 - **Redis Cluster** — Connect to a cluster via `cluster_nodes`; all commands go through the cluster connection.
 - **Full SQL on metadata tables** — SELECT with multi-condition WHERE (AND/OR/IN/BETWEEN/LIKE), ORDER BY, LIMIT; aggregates (COUNT/SUM/AVG/MIN/MAX) and GROUP BY; column aliases; INSERT/UPDATE/DELETE via `execute_query`.
 
@@ -46,7 +47,7 @@ This plugin connects to Redis and exposes logical databases (0-15), metadata tab
 - **Host** — Redis server host (default `127.0.0.1`).
 - **Port** — Redis port (default `6379`).
 - **Database** — Logical database index 0-15. Select one in the connection form.
-- **Username** — Redis often does not use a username. Tabularis may disable "Load Databases" when the Username field is empty; if you need to load the database list, enter a placeholder (e.g. `default`); it is not sent to Redis.
+- **Username** — The plugin manifest sets a default of `default` so the UI can pre-fill it. Redis 6+ ACL uses `default` as the built-in user; leave as-is for typical setups or change if using ACL.
 - **Password** — Optional; used for AUTH when provided.
 
 ### TLS and timeouts
@@ -55,11 +56,15 @@ Connection params (when supported by the app or connection string) can include:
 
 - **TLS** — Set `tls: true` or use `ssl_mode: "require"` / `"verify-full"` / `"verify-ca"` / `"prefer"` to connect over TLS (`rediss://`). Uses rustls (no OpenSSL dependency).
 - **Timeouts** — `connect_timeout_ms`, `read_timeout_ms`, `write_timeout_ms` (defaults 5000, 10000, 10000). The plugin uses `get_connection_with_timeout` and sets read/write timeouts on the connection.
-- **Health checks** — Before reusing a cached connection, the plugin pings Redis; on failure it evicts the connection and opens a new one.
+- **Health checks** — Cached connections are reused if the socket is still open (`is_open()`); on the next command failure the app can reconnect. No PING on every request.
 
 ### Redis Cluster
 
-For a Redis Cluster deployment, pass `cluster_nodes: ["redis://host1:6379", "redis://host2:6379", ...]` in the connection params. The plugin builds a `ClusterClient` and uses a cluster connection for all commands. Sentinel is not yet supported.
+For a Redis Cluster deployment, pass `cluster_nodes: ["redis://host1:6379", "redis://host2:6379", ...]` in the connection params. The plugin builds a `ClusterClient` and uses a cluster connection for all commands.
+
+### Redis Sentinel
+
+For high-availability setups using [Redis Sentinel](https://redis.io/docs/management/sentinel/), set `sentinel_master` to the master name (e.g. `mymaster`) and `sentinel_nodes` to a list of Sentinel endpoints (e.g. `["redis://sentinel1:26379", "redis://sentinel2:26379"]`). The plugin uses the `redis` crate’s Sentinel support to resolve the current master and connect with the same auth/TLS/timeouts as for a direct connection. Connection cache keys include Sentinel identity so different masters or node lists use separate connections.
 
 ## Virtual Tables and Query Syntax
 
@@ -80,7 +85,7 @@ For the virtual table `__redis_keys__` (and key-pattern tables like `__keys:stre
 | `ORDER BY value` | ASC or DESC | Sort by value preview, then key |
 | `LIMIT n` | `LIMIT 500` | Cap rows (and page size when no page_size) |
 
-The app may send `limit` and `page`; the plugin uses `limit` as page size when `page_size` is not provided.
+Multiple conditions in `WHERE` are supported with `AND` (e.g. `WHERE key LIKE 'u%' AND type = 'hash'`). The app may send `limit`, `page`, and `app_limit`; the plugin applies `app_limit` to cap how many keys are scanned for virtual key queries. ORDER BY on metadata tables uses type-aware comparison (numbers by value, then bools, then strings). The plugin uses `limit` as page size when `page_size` is not provided. Pagination always returns a numeric `total_rows` so the UI can show "Page X of Y" correctly (when the scan is capped, the count is the number of keys scanned so far).
 
 ### SQL on metadata tables
 
@@ -89,9 +94,23 @@ For **metadata tables** (Hash/RedisJSON row storage), `execute_query` accepts fu
 - **SELECT** — `SELECT col1, col2 AS alias, * FROM table [WHERE ...] [ORDER BY col ASC|DESC] [LIMIT n]`. WHERE supports multiple conditions with `AND` / `OR`, `IN (v1, v2)`, `BETWEEN a AND b`, and comparisons (`=`, `!=`, `<`, `>`, `<=`, `>=`). `LIKE 'pattern'` is supported (`%` = any sequence, `_` = any character). Column aliases (e.g. `col AS alias`) are reflected in result headers.
 - **Aggregates** — `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` with optional `GROUP BY col1, col2`. Result is one row per group (or one row when no GROUP BY).
 - **INSERT / UPDATE / DELETE** — `INSERT INTO table (col1, col2) VALUES ('a', 'b')`, `UPDATE table SET col = 'x' [WHERE ...]`, `DELETE FROM table [WHERE ...]`. DML is executed via the same CRUD layer as the app’s insert/update/delete methods; result returns `affected_rows` and `execution_time_ms`.
-- **DDL** — `CREATE [UNIQUE] INDEX name ON table (col1, col2)` and `DROP TABLE [IF EXISTS] table` are supported as before.
+- **DDL** — `CREATE [UNIQUE] INDEX name ON table (col1, col2)` and `DROP TABLE [IF EXISTS] [schema.]table` are supported. When the UI sends a schema-qualified name (e.g. `"0"."test_data"`), the plugin strips the schema and drops the table by its short name.
 
 Virtual key tables (`__redis_keys__`, `__keys:prefix__`) continue to use the legacy SQL-like parser (WHERE key/type/value, ORDER BY, LIMIT) as described above.
+
+### Type-specific virtual tables (hashes, lists, sets, zsets, streams)
+
+The plugin exposes five read-only virtual tables that list Redis key contents by type:
+
+| Table    | Columns        | Description |
+|----------|----------------|-------------|
+| `hashes` | key, field, value | All hash keys; each row is one field-value pair. |
+| `lists`  | key, index, value | All list keys; each row is one element (index 0-based). |
+| `sets`   | key, value     | All set keys; each row is one member. |
+| `zsets`  | key, value, score | All sorted-set keys; each row is one member and its score. |
+| `streams`| key, id, fields | All stream keys; each row is one entry (id and fields as JSON). |
+
+Use `SELECT * FROM hashes`, `SELECT * FROM lists`, etc. to scan all keys of that type (with pagination). To target one key, use `WHERE key = 'keyname'`, e.g. `SELECT * FROM hashes WHERE key = 'user:1'`. Hash/list/set/zset/stream data that is not valid UTF-8 is displayed using lossy conversion so the UI never fails with a UTF-8 error.
 
 ### CRUD on virtual key tables
 
@@ -139,13 +158,13 @@ One Redis connection is used for the session. Key discovery (SCAN, TYPE, value p
 | `test_connection` | Ping Redis |
 | `get_databases` | List logical databases (0-15) |
 | `get_schemas` | Returns `[]` (Redis has no schemas) |
-| `get_tables` | List metadata tables plus `__redis_keys__` and key-pattern tables (`__keys:prefix__`) |
-| `get_columns` | Column metadata for a table; for `__redis_keys__` / key-pattern tables returns key, type, value, ttl_seconds, key_raw |
+| `get_tables` | List metadata tables, `__redis_keys__`, key-pattern tables (`__keys:prefix__`), and type-specific tables (hashes, lists, sets, zsets, streams) |
+| `get_columns` | Column metadata for a table; for `__redis_keys__` / key-pattern tables returns key, type, value, ttl_seconds, key_raw; for type tables returns the columns listed above |
 | `get_foreign_keys` | Returns `[]` |
 | `get_indexes` | Index metadata for metadata tables |
 | `get_pubsub_channels` | List active Pub/Sub channels with subscriber counts |
 | `get_server_info` | Redis server info (INFO ALL) as structured JSON |
-| `execute_query` | Run SQL: SELECT (with WHERE/ORDER BY/LIMIT, aggregates, GROUP BY, aliases, LIKE on metadata tables), INSERT/UPDATE/DELETE (DML), CREATE INDEX, DROP TABLE; for `__redis_keys__` / key-pattern tables supports WHERE/ORDER BY/LIMIT as in Virtual Tables |
+| `execute_query` | Run SQL: SELECT (with WHERE/ORDER BY/LIMIT, aggregates, GROUP BY, aliases, LIKE on metadata tables), INSERT/UPDATE/DELETE (DML), CREATE INDEX, DROP TABLE; for `__redis_keys__` / key-pattern tables supports WHERE/ORDER BY/LIMIT as in Virtual Tables; for type tables (hashes, lists, sets, zsets, streams) supports `SELECT * [WHERE key = 'x']` with pagination |
 | `insert_record` | Insert row into a metadata table; for virtual key tables creates a Redis key (string/hash/list/set/zset) |
 | `insert_records_batch` | Bulk insert: `table` + `rows`; returns affected count |
 | `update_record` | Update row by primary key; for virtual key tables supports `value` and `ttl_seconds` (string/hash/list/set/zset) |
@@ -164,6 +183,19 @@ One Redis connection is used for the session. Key discovery (SCAN, TYPE, value p
 | `drop_foreign_key` | No-op (no FKs) |
 
 Views and routines are not supported; the plugin returns empty or stub responses for those methods.
+
+### Capabilities summary
+
+| Area | Supported | Notes |
+|------|-----------|--------|
+| Single-node Redis | Yes | Default; optional TLS and timeouts |
+| Redis Cluster | Yes | Via `cluster_nodes` |
+| Redis Sentinel | Yes | Via `sentinel_master` + `sentinel_nodes`; master resolved at connect |
+| Connection cache | Yes | Key includes host, port, db, auth, TLS, cluster/Sentinel identity; reuse when connection is still open (no PING per request) |
+| Batch insert | Yes | Pipelined chunks for metadata tables; virtual key table inserts one-by-one |
+| Batch delete | Yes | Pipelined DEL/SREM for metadata and virtual keys |
+| Transactions | API only | `run_transaction` (MULTI/EXEC, optional WATCH) is available on the client for future use; not yet used by Tabularis RPC methods |
+| Credentials in logs | No | URLs and connection info are redacted in log output |
 
 ## Building from Source
 
@@ -190,7 +222,17 @@ A test binary simulates Tabularis by sending JSON-RPC requests to the plugin ove
 cargo run --bin test_plugin
 ```
 
-Use a Redis instance with test data (e.g. keys like `batch:*`, `stress:*`) to exercise key-pattern tables and type filtering.
+Use a Redis instance with test data (e.g. keys like `batch:*`, `stress:*`) to exercise key-pattern tables and type filtering. The harness can be extended to validate connection cache isolation (different auth/TLS params yield distinct cache keys), virtual key query limits (`app_limit`), type-aware ORDER BY on metadata tables, and Sentinel connectivity (requires a running Sentinel deployment).
+
+### Performance and baseline timings
+
+Virtual-key and pagination paths use shared ownership (`Arc<Vec<u8>>`) for scanned keys and slice-based APIs (`&[&[u8]]`) for batch type/preview/TTL calls to reduce clones and allocation. Value-filter parsing uses [beef](https://github.com/maciejhirsz/beef) `Cow` for borrowed string segments where possible. To capture timing baselines for virtual key and pagination scenarios (e.g. before/after changes), run:
+
+```bash
+TABULARIS_PLUGIN_PERF=1 cargo run --bin test_plugin
+```
+
+Timings for `__redis_keys__` page 1/page 2, `__keys_batch__` page 1, and filter/order-by value are printed to stderr. RSS can be measured with external tools (e.g. `time -v`).
 
 ### Tech Stack
 
@@ -198,8 +240,5 @@ Use a Redis instance with test data (e.g. keys like `batch:*`, `stress:*`) to ex
 - **Redis client:** [redis](https://crates.io/crates/redis) 1.x (TLS via rustls, cluster support)
 - **SQL parsing:** [sqlparser](https://crates.io/crates/sqlparser) for metadata-table SELECT/DML/DDL
 - **Serialization:** serde + serde_json
+- **Strings:** [beef](https://github.com/maciejhirsz/beef) for compact Cow in value-filter parsing
 - **Protocol:** JSON-RPC 2.0 over stdio
-
-## License
-
-Apache License 2.0

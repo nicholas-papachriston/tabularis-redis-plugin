@@ -162,7 +162,7 @@ mod tests {
 pub fn key_value_preview_batch(
     conn: &mut impl ConnectionLike,
     has_redis_json: bool,
-    keys: &[&Vec<u8>],
+    keys: &[&[u8]],
     types: &[String],
     json_path: Option<&str>,
 ) -> Result<Vec<String>, String> {
@@ -170,34 +170,35 @@ pub fn key_value_preview_batch(
         return Ok(vec![]);
     }
     let hash_field = json_path_first_field(json_path);
+    let hash_field_str = hash_field.as_deref();
     let mut value_pipe = redis::pipe();
     for (key, t) in keys.iter().zip(types.iter()) {
         match t.as_str() {
-            "string" => value_pipe.cmd("GET").arg(key.as_slice()),
+            "string" => value_pipe.cmd("GET").arg(*key),
             "ReJSON-RL" if has_redis_json => value_pipe
                 .cmd("JSON.GET")
-                .arg(key.as_slice())
+                .arg(*key)
                 .arg(json_path.unwrap_or("$")),
-            "hash" if hash_field.is_some() => value_pipe
+            "hash" if hash_field_str.is_some() => value_pipe
                 .cmd("HGET")
-                .arg(key.as_slice())
-                .arg(hash_field.as_ref().unwrap().as_str()),
+                .arg(*key)
+                .arg(hash_field_str.unwrap_or("")),
             "hash" => value_pipe
                 .cmd("HSCAN")
-                .arg(key.as_slice())
+                .arg(*key)
                 .arg(0u8)
                 .arg("COUNT")
                 .arg(5),
-            "list" => value_pipe.cmd("LLEN").arg(key.as_slice()),
+            "list" => value_pipe.cmd("LLEN").arg(*key),
             "set" => value_pipe
                 .cmd("SSCAN")
-                .arg(key.as_slice())
+                .arg(*key)
                 .arg(0u8)
                 .arg("COUNT")
                 .arg(5),
-            "zset" => value_pipe.cmd("ZCARD").arg(key.as_slice()),
-            "stream" => value_pipe.cmd("XLEN").arg(key.as_slice()),
-            _ => value_pipe.cmd("TYPE").arg(key.as_slice()),
+            "zset" => value_pipe.cmd("ZCARD").arg(*key),
+            "stream" => value_pipe.cmd("XLEN").arg(*key),
+            _ => value_pipe.cmd("TYPE").arg(*key),
         };
     }
     let values: Vec<RedisValue> = value_pipe.query(conn).map_err(|e| e.to_string())?;
@@ -212,7 +213,7 @@ pub fn key_value_preview_batch(
 pub fn key_type_and_preview_batch(
     conn: &mut impl ConnectionLike,
     has_redis_json: bool,
-    keys: &[&Vec<u8>],
+    keys: &[&[u8]],
     json_path: Option<&str>,
 ) -> Result<Vec<(String, String)>, String> {
     if keys.is_empty() {
@@ -220,38 +221,39 @@ pub fn key_type_and_preview_batch(
     }
     let mut type_pipe = redis::pipe();
     for k in keys {
-        type_pipe.cmd("TYPE").arg(k.as_slice());
+        type_pipe.cmd("TYPE").arg(*k);
     }
     let types: Vec<String> = type_pipe.query(conn).map_err(|e| e.to_string())?;
     let hash_field = json_path_first_field(json_path);
+    let hash_field_str = hash_field.as_deref();
     let mut value_pipe = redis::pipe();
     for (key, t) in keys.iter().zip(types.iter()) {
         match t.as_str() {
-            "string" => value_pipe.cmd("GET").arg(key.as_slice()),
+            "string" => value_pipe.cmd("GET").arg(*key),
             "ReJSON-RL" if has_redis_json => value_pipe
                 .cmd("JSON.GET")
-                .arg(key.as_slice())
+                .arg(*key)
                 .arg(json_path.unwrap_or("$")),
-            "hash" if hash_field.is_some() => value_pipe
+            "hash" if hash_field_str.is_some() => value_pipe
                 .cmd("HGET")
-                .arg(key.as_slice())
-                .arg(hash_field.as_ref().unwrap().as_str()),
+                .arg(*key)
+                .arg(hash_field_str.unwrap_or("")),
             "hash" => value_pipe
                 .cmd("HSCAN")
-                .arg(key.as_slice())
+                .arg(*key)
                 .arg(0u8)
                 .arg("COUNT")
                 .arg(5),
-            "list" => value_pipe.cmd("LLEN").arg(key.as_slice()),
+            "list" => value_pipe.cmd("LLEN").arg(*key),
             "set" => value_pipe
                 .cmd("SSCAN")
-                .arg(key.as_slice())
+                .arg(*key)
                 .arg(0u8)
                 .arg("COUNT")
                 .arg(5),
-            "zset" => value_pipe.cmd("ZCARD").arg(key.as_slice()),
-            "stream" => value_pipe.cmd("XLEN").arg(key.as_slice()),
-            _ => value_pipe.cmd("TYPE").arg(key.as_slice()),
+            "zset" => value_pipe.cmd("ZCARD").arg(*key),
+            "stream" => value_pipe.cmd("XLEN").arg(*key),
+            _ => value_pipe.cmd("TYPE").arg(*key),
         };
     }
     let values: Vec<RedisValue> = value_pipe.query(conn).map_err(|e| e.to_string())?;

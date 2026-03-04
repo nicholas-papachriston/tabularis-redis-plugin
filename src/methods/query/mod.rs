@@ -2,22 +2,94 @@ mod aggregates;
 mod parser;
 mod redis_keys;
 mod sql_parser;
+mod type_tables;
 
 use crate::metadata::RowStorageMode;
 use crate::methods::common::AppError;
 use crate::methods::crud;
-use crate::methods::ddl;
 use crate::methods::discovery;
 use crate::models::IndexDef;
 use crate::redis_client::RedisClient;
 use serde_json::Value as JsonValue;
 use std::time::Instant;
 
-use parser::{
-    json_value_to_cmp_str, parse_order_by, parse_where, row_values_for_columns, PageResult,
-};
+use parser::{json_value_cmp, json_value_to_cmp_str, row_values_for_columns};
 use redis_keys::execute_redis_keys_scan;
 use sql_parser::{evaluate_where, parse_sql, ParsedStatement};
+use type_tables::execute_type_table_scan;
+
+/// Fetch one row as column values; returns None if the row is missing or not an object/hash.
+fn fetch_row_values(
+    client: &mut RedisClient,
+    table: &str,
+    pk: &str,
+    columns: &[String],
+    mode: RowStorageMode,
+) -> Result<Option<Vec<JsonValue>>, AppError> {
+    match mode {
+        RowStorageMode::Json => {
+            let opt = client
+                .metadata()
+                .get_row_json(table, pk)
+                .map_err(AppError::Backend)?;
+            let Some(obj) = opt.and_then(|v| v.as_object().cloned()) else {
+                return Ok(None);
+            };
+            Ok(Some(row_values_for_columns(columns, pk, None, Some(&obj))))
+        }
+        RowStorageMode::Hash => {
+            let opt = client
+                .metadata()
+                .get_row_hash(table, pk)
+                .map_err(AppError::Backend)?;
+            let Some(map) = opt.as_ref() else {
+                return Ok(None);
+            };
+            Ok(Some(row_values_for_columns(columns, pk, Some(map), None)))
+        }
+    }
+}
+
+/// Fetch multiple rows in one pipelined batch. Returns row values in same order as pks; skips missing/empty.
+fn fetch_rows_batch(
+    client: &mut RedisClient,
+    table: &str,
+    columns: &[String],
+    mode: RowStorageMode,
+    pks: &[String],
+) -> Result<Vec<Vec<JsonValue>>, AppError> {
+    if pks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity(pks.len());
+    match mode {
+        RowStorageMode::Hash => {
+            let maps = client
+                .metadata()
+                .get_rows_hash_batch(table, pks)
+                .map_err(AppError::Backend)?;
+            for (pk, map) in pks.iter().zip(maps) {
+                if map.is_empty() {
+                    continue;
+                }
+                out.push(row_values_for_columns(columns, pk, Some(&map), None));
+            }
+        }
+        RowStorageMode::Json => {
+            let opts = client
+                .metadata()
+                .get_rows_json_batch(table, pks)
+                .map_err(AppError::Backend)?;
+            for (pk, opt) in pks.iter().zip(opts) {
+                let Some(JsonValue::Object(obj)) = opt.as_ref() else {
+                    continue;
+                };
+                out.push(row_values_for_columns(columns, pk, None, Some(obj)));
+            }
+        }
+    }
+    Ok(out)
+}
 
 /// Parse CREATE [UNIQUE] INDEX name ON table (col1, col2) and persist index metadata.
 fn execute_create_index(client: &mut RedisClient, q: &str) -> Result<JsonValue, AppError> {
@@ -71,7 +143,7 @@ fn execute_create_index(client: &mut RedisClient, q: &str) -> Result<JsonValue, 
         "execute_create_index: table={table} index={idx_name} columns={}",
         columns.len()
     );
-    let mut indexes = client.get_table_indexes(&table)?;
+    let mut indexes = client.metadata().get_table_indexes(&table)?;
     if indexes.iter().any(|i| i.index_name == idx_name) {
         return Err(AppError::Conflict(format!(
             "Index '{idx_name}' already exists"
@@ -82,7 +154,7 @@ fn execute_create_index(client: &mut RedisClient, q: &str) -> Result<JsonValue, 
         columns,
         is_unique,
     });
-    client.set_table_indexes(&table, &indexes)?;
+    client.metadata().set_table_indexes(&table, &indexes)?;
     Ok(serde_json::json!({
         "columns": [],
         "rows": [],
@@ -107,7 +179,7 @@ fn execute_select_parsed(
 
     let table = sel.table.as_str();
     let column_names: Vec<String> = if sel.columns.len() == 1 && sel.columns[0].name == "*" {
-        match client.get_table_columns(table)? {
+        match client.metadata().get_table_columns(table)? {
             Some(cols) if !cols.is_empty() => cols.into_iter().map(|x| x.name).collect(),
             _ => client
                 .infer_columns_from_data(table)?
@@ -130,31 +202,18 @@ fn execute_select_parsed(
             "Table '{table}' has no rows and no primary key metadata"
         ))
     })?;
-    let mode = client.get_table_mode(table)?;
+    let mode = client.metadata().get_table_mode(table)?;
     let need_full_scan = sel.where_clause.is_some() || !sel.order_by.is_empty();
     let skip = usize::try_from((page.saturating_sub(1)) * page_size).unwrap_or(0);
     let take_n = usize::try_from(page_size).unwrap_or(usize::MAX);
     let sql_limit = sel.limit.map(|n| usize::try_from(n).unwrap_or(usize::MAX));
 
     let (total_count, page_rows) = if need_full_scan {
-        let all_keys = client.list_row_keys(table)?;
+        let all_keys = client.metadata().list_row_keys(table)?;
         let mut rows_with_pk: Vec<(String, Vec<JsonValue>)> = Vec::new();
         for pk in &all_keys {
-            let row_values: Vec<JsonValue> = match mode {
-                RowStorageMode::Json => {
-                    let opt = client.get_row_json(table, pk)?;
-                    let Some(obj) = opt.and_then(|v| v.as_object().cloned()) else {
-                        continue;
-                    };
-                    row_values_for_columns(&column_names, pk, None, Some(&obj))
-                }
-                RowStorageMode::Hash => {
-                    let opt = client.get_row_hash(table, pk)?;
-                    let Some(map) = opt.as_ref() else {
-                        continue;
-                    };
-                    row_values_for_columns(&column_names, pk, Some(map), None)
-                }
+            let Some(row_values) = fetch_row_values(client, table, pk, &column_names, mode)? else {
+                continue;
             };
             let matches = sel.where_clause.as_ref().is_none_or(|expr| {
                 let row_strs: Vec<String> = row_values.iter().map(json_value_to_cmp_str).collect();
@@ -167,9 +226,7 @@ fn execute_select_parsed(
         if let Some((ref col, asc)) = sel.order_by.first() {
             if let Some(idx) = column_names.iter().position(|c| c == col) {
                 rows_with_pk.sort_by(|a, b| {
-                    let a_str = json_value_to_cmp_str(&a.1[idx]);
-                    let b_str = json_value_to_cmp_str(&b.1[idx]);
-                    let ord = a_str.cmp(&b_str);
+                    let ord = json_value_cmp(&a.1[idx], &b.1[idx]);
                     if *asc {
                         ord
                     } else {
@@ -190,53 +247,25 @@ fn execute_select_parsed(
             .collect();
         (total as u64, page_rows)
     } else if sel.where_clause.is_none() {
-        let (page_keys, paged_has_more) = client.list_row_keys_paged(table, skip, take_n)?;
+        let (page_keys, paged_has_more) =
+            client.metadata().list_row_keys_paged(table, skip, take_n)?;
         let total = if paged_has_more {
             skip as u64 + (page_keys.len() as u64) + 1
         } else {
             skip as u64 + (page_keys.len() as u64)
         };
-        let mut out = Vec::new();
-        for pk in &page_keys {
-            let row_values: Vec<JsonValue> = match mode {
-                RowStorageMode::Json => {
-                    let opt = client.get_row_json(table, pk)?;
-                    let Some(obj) = opt.and_then(|v| v.as_object().cloned()) else {
-                        continue;
-                    };
-                    row_values_for_columns(&column_names, pk, None, Some(&obj))
-                }
-                RowStorageMode::Hash => {
-                    let opt = client.get_row_hash(table, pk)?;
-                    let Some(map) = opt.as_ref() else {
-                        continue;
-                    };
-                    row_values_for_columns(&column_names, pk, Some(map), None)
-                }
-            };
-            out.push(row_values);
-        }
+        let out = fetch_rows_batch(client, table, &column_names, mode, &page_keys)?;
         (total, out)
     } else {
-        let all_keys = client.list_row_keys(table)?;
+        let all_keys = client.metadata().list_row_keys(table)?;
         let mut filtered: Vec<String> = all_keys;
         if let Some(ref expr) = sel.where_clause {
             filtered.retain(|pk| {
-                let row_values: Vec<JsonValue> = match mode {
-                    RowStorageMode::Json => {
-                        let opt = client.get_row_json(table, pk).ok().flatten();
-                        let Some(obj) = opt.and_then(|v| v.as_object().cloned()) else {
-                            return false;
-                        };
-                        row_values_for_columns(&column_names, pk, None, Some(&obj))
-                    }
-                    RowStorageMode::Hash => {
-                        let opt = client.get_row_hash(table, pk).ok().flatten();
-                        let Some(map) = opt else {
-                            return false;
-                        };
-                        row_values_for_columns(&column_names, pk, Some(&map), None)
-                    }
+                let Some(row_values) = fetch_row_values(client, table, pk, &column_names, mode)
+                    .ok()
+                    .flatten()
+                else {
+                    return false;
                 };
                 let row_strs: Vec<String> = row_values.iter().map(json_value_to_cmp_str).collect();
                 evaluate_where(&column_names, &row_strs, expr)
@@ -247,26 +276,7 @@ fn execute_select_parsed(
         }
         let total = filtered.len();
         let page_keys: Vec<String> = filtered.into_iter().skip(skip).take(take_n).collect();
-        let mut out = Vec::new();
-        for pk in &page_keys {
-            let row_values: Vec<JsonValue> = match mode {
-                RowStorageMode::Json => {
-                    let opt = client.get_row_json(table, pk)?;
-                    let Some(obj) = opt.and_then(|v| v.as_object().cloned()) else {
-                        continue;
-                    };
-                    row_values_for_columns(&column_names, pk, None, Some(&obj))
-                }
-                RowStorageMode::Hash => {
-                    let opt = client.get_row_hash(table, pk)?;
-                    let Some(map) = opt.as_ref() else {
-                        continue;
-                    };
-                    row_values_for_columns(&column_names, pk, Some(map), None)
-                }
-            };
-            out.push(row_values);
-        }
+        let out = fetch_rows_batch(client, table, &column_names, mode, &page_keys)?;
         (total as u64, out)
     };
 
@@ -304,32 +314,19 @@ fn execute_select_aggregated(
     start: std::time::Instant,
 ) -> Result<JsonValue, AppError> {
     let table = sel.table.as_str();
-    let column_names: Vec<String> = match client.get_table_columns(table)? {
+    let column_names: Vec<String> = match client.metadata().get_table_columns(table)? {
         Some(cols) if !cols.is_empty() => cols.into_iter().map(|x| x.name).collect(),
         _ => client
             .infer_columns_from_data(table)?
             .map(|c| c.into_iter().map(|x| x.name).collect())
             .unwrap_or_default(),
     };
-    let mode = client.get_table_mode(table)?;
-    let all_keys = client.list_row_keys(table)?;
+    let mode = client.metadata().get_table_mode(table)?;
+    let all_keys = client.metadata().list_row_keys(table)?;
     let mut rows: Vec<Vec<JsonValue>> = Vec::new();
     for pk in &all_keys {
-        let row_values: Vec<JsonValue> = match mode {
-            RowStorageMode::Json => {
-                let opt = client.get_row_json(table, pk)?;
-                let Some(obj) = opt.and_then(|v| v.as_object().cloned()) else {
-                    continue;
-                };
-                row_values_for_columns(&column_names, pk, None, Some(&obj))
-            }
-            RowStorageMode::Hash => {
-                let opt = client.get_row_hash(table, pk)?;
-                let Some(map) = opt.as_ref() else {
-                    continue;
-                };
-                row_values_for_columns(&column_names, pk, Some(map), None)
-            }
+        let Some(row_values) = fetch_row_values(client, table, pk, &column_names, mode)? else {
+            continue;
         };
         let matches = sel.where_clause.as_ref().is_none_or(|expr| {
             let row_strs: Vec<String> = row_values.iter().map(json_value_to_cmp_str).collect();
@@ -415,29 +412,16 @@ fn execute_update_parsed(
     let pk_col = client
         .get_table_pk_or_inferred(table)?
         .ok_or_else(|| AppError::Backend(format!("Table '{table}' has no primary key")))?;
-    let mode = client.get_table_mode(table)?;
-    let column_names = client.get_table_columns(table)?.map_or_else(
+    let mode = client.metadata().get_table_mode(table)?;
+    let column_names = client.metadata().get_table_columns(table)?.map_or_else(
         || upd.assignments.iter().map(|(k, _)| k.clone()).collect(),
         |c| c.into_iter().map(|x| x.name).collect::<Vec<_>>(),
     );
-    let all_keys = client.list_row_keys(table)?;
+    let all_keys = client.metadata().list_row_keys(table)?;
     let mut affected = 0u64;
     for pk in &all_keys {
-        let row_values: Vec<JsonValue> = match mode {
-            RowStorageMode::Json => {
-                let opt = client.get_row_json(table, pk)?;
-                let Some(obj) = opt.and_then(|v| v.as_object().cloned()) else {
-                    continue;
-                };
-                row_values_for_columns(&column_names, pk, None, Some(&obj))
-            }
-            RowStorageMode::Hash => {
-                let opt = client.get_row_hash(table, pk)?;
-                let Some(map) = opt.as_ref() else {
-                    continue;
-                };
-                row_values_for_columns(&column_names, pk, Some(map), None)
-            }
+        let Some(row_values) = fetch_row_values(client, table, pk, &column_names, mode)? else {
+            continue;
         };
         let row_strs: Vec<String> = row_values.iter().map(json_value_to_cmp_str).collect();
         let matches = upd
@@ -487,29 +471,17 @@ fn execute_delete_parsed(
     let pk_col = client
         .get_table_pk_or_inferred(table)?
         .ok_or_else(|| AppError::Backend(format!("Table '{table}' has no primary key")))?;
-    let mode = client.get_table_mode(table)?;
+    let mode = client.metadata().get_table_mode(table)?;
     let column_names = client
+        .metadata()
         .get_table_columns(table)?
         .map(|c| c.into_iter().map(|x| x.name).collect::<Vec<_>>())
         .unwrap_or_default();
-    let all_keys = client.list_row_keys(table)?;
+    let all_keys = client.metadata().list_row_keys(table)?;
     let mut affected = 0u64;
     for pk in &all_keys {
-        let row_values: Vec<JsonValue> = match mode {
-            RowStorageMode::Json => {
-                let opt = client.get_row_json(table, pk)?;
-                let Some(obj) = opt.and_then(|v| v.as_object().cloned()) else {
-                    continue;
-                };
-                row_values_for_columns(&column_names, pk, None, Some(&obj))
-            }
-            RowStorageMode::Hash => {
-                let opt = client.get_row_hash(table, pk)?;
-                let Some(map) = opt.as_ref() else {
-                    continue;
-                };
-                row_values_for_columns(&column_names, pk, Some(map), None)
-            }
+        let Some(row_values) = fetch_row_values(client, table, pk, &column_names, mode)? else {
+            continue;
         };
         let row_strs: Vec<String> = row_values.iter().map(json_value_to_cmp_str).collect();
         let matches = del
@@ -540,7 +512,7 @@ fn execute_delete_parsed(
     Ok(result)
 }
 
-/// Parse "DROP TABLE [IF EXISTS] `table_name`" and return the table name if matched.
+/// Parse "DROP TABLE [IF EXISTS] [schema.]`table_name`" and return the table name (no schema). Handles "`0"."test_data`" from UI.
 fn parse_drop_table(q: &str) -> Option<String> {
     let upper = q.trim().to_uppercase();
     if !upper.starts_with("DROP TABLE") {
@@ -553,15 +525,86 @@ fn parse_drop_table(q: &str) -> Option<String> {
     } else {
         rest
     };
-    let table = after_keywords
-        .trim_end_matches(';')
-        .trim()
-        .trim_matches('"')
+    let raw = after_keywords.trim_end_matches(';').trim();
+    let table = raw
+        .rfind("\".\"")
+        .map_or_else(
+            || {
+                raw.find('.').map_or_else(
+                    || raw.trim_matches('"'),
+                    |dot| raw[dot + 1..].trim().trim_matches('"'),
+                )
+            },
+            |dot| raw[dot + 3..].trim().trim_matches('"'),
+        )
         .to_string();
     if table.is_empty() {
         return None;
     }
     Some(table)
+}
+
+/// If `after_from` is "( inner ) AS alias" (app Total Limit wrapper), return the inner query.
+/// Finds the matching ')' while skipping single- and double-quoted strings.
+fn extract_wrapped_subquery(after_from: &str) -> Option<String> {
+    let s = after_from.trim();
+    if !s.starts_with('(') {
+        return None;
+    }
+    let mut depth: i32 = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            if b == b'\'' && (i + 1 >= bytes.len() || bytes[i + 1] != b'\'') {
+                in_single = false;
+            } else if b == b'\'' && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if b == b'"' && (i + 1 >= bytes.len() || bytes[i + 1] != b'"') {
+                in_double = false;
+            } else if b == b'"' && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    let inner = s[1..i].trim();
+                    return if inner.to_uppercase().starts_with("SELECT ") {
+                        Some(inner.to_string())
+                    } else {
+                        None
+                    };
+                }
+                i += 1;
+            }
+            b'\'' => {
+                in_single = true;
+                i += 1;
+            }
+            b'"' => {
+                in_double = true;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_lines)]
@@ -590,7 +633,10 @@ pub fn execute_query(
     }
     if let Some(table) = parse_drop_table(q) {
         log::debug!("execute_query: delegating to drop_table for {table}");
-        ddl::drop_table(client, None, &table)?;
+        client
+            .metadata()
+            .drop_table(&table)
+            .map_err(AppError::Backend)?;
         return Ok(serde_json::json!({
             "columns": [],
             "rows": [],
@@ -619,36 +665,62 @@ pub fn execute_query(
         return Err(AppError::Backend("Only SELECT is supported".into()));
     }
 
-    if let Ok(ParsedStatement::Select(ref sel)) = parse_sql(q) {
-        let table = sel.table.as_str();
-        if table != discovery::REDIS_KEYS_TABLE && !discovery::is_key_pattern_table(table) {
-            return execute_select_parsed(client, sel, page, page_size, start);
-        }
-    }
-
     let from_idx = upper
         .find(" FROM ")
         .ok_or_else(|| AppError::Backend("Missing FROM clause".into()))?;
     let select_part = q[..from_idx].trim();
     let after_from = q[from_idx + 6..].trim();
-    let table_raw = after_from
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| AppError::Backend("Missing table name after FROM".into()))?
-        .trim();
-    if table_raw.starts_with('(') {
+    if after_from.trim_start().starts_with('(') {
+        if let Some(inner) = extract_wrapped_subquery(after_from) {
+            let upper_select = select_part.to_uppercase();
+            if upper_select.contains("COUNT(*)") && upper_select.trim().starts_with("SELECT") {
+                log::debug!(
+                    "execute_query: COUNT(*) FROM (subquery), running inner for total count"
+                );
+                let inner_result = execute_query(client, &inner, 1, 1, None, json_path)?;
+                let total: u64 = inner_result
+                    .get("pagination")
+                    .and_then(|p| p.get("total_rows"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let elapsed = start.elapsed().as_millis();
+                return Ok(serde_json::json!({
+                    "columns": ["COUNT(*)"],
+                    "rows": [[total]],
+                    "affected_rows": 0u64,
+                    "truncated": false,
+                    "pagination": { "page": 1, "page_size": 1, "total_rows": total, "has_more": false },
+                    "execution_time_ms": u64::try_from(elapsed).unwrap_or(u64::MAX)
+                }));
+            }
+            log::debug!(
+                "execute_query: unwrapping app subquery (Total Limit), inner query len={}",
+                inner.len()
+            );
+            return execute_query(client, &inner, page, page_size, app_limit, json_path);
+        }
         return Err(AppError::Backend(
             "Subqueries are not supported. Use a table name directly (e.g. SELECT * FROM __redis_keys__).".into(),
         ));
     }
-    let table = table_raw
-        .trim_matches('"')
-        .trim_matches('(')
-        .trim_matches(')');
-    if table.is_empty() {
-        return Err(AppError::Backend("Missing table name after FROM".into()));
-    }
 
+    let Ok(ParsedStatement::Select(sel)) = parse_sql(q) else {
+        return Err(AppError::Backend("Invalid or unsupported SELECT".into()));
+    };
+
+    let table = sel.table.as_str();
+    if discovery::is_type_virtual_table(table) {
+        let mut result = execute_type_table_scan(client, table, q, page, page_size)?;
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert(
+                "execution_time_ms".to_string(),
+                JsonValue::Number(serde_json::Number::from(
+                    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                )),
+            );
+        }
+        return Ok(result);
+    }
     let (is_virtual_table, pattern_override) = match discovery::virtual_table_scan_target(table) {
         Some(discovery::VirtualScanTarget::AllKeys) => (true, None),
         Some(discovery::VirtualScanTarget::Pattern(prefix)) => (true, Some(format!("{prefix}:*"))),
@@ -671,196 +743,7 @@ pub fn execute_query(
         )
         .map_err(AppError::Backend)?
     } else {
-        let columns = if select_part["SELECT".len()..].trim() == "*" {
-            match client.get_table_columns(table)? {
-                Some(cols) if !cols.is_empty() => {
-                    cols.into_iter().map(|x| x.name).collect::<Vec<_>>()
-                }
-                _ => client
-                    .infer_columns_from_data(table)?
-                    .map(|c| c.into_iter().map(|x| x.name).collect::<Vec<_>>())
-                    .unwrap_or_default(),
-            }
-        } else {
-            let col_list = select_part["SELECT".len()..].trim();
-            col_list
-                .split(',')
-                .map(|s| s.trim().trim_matches('"').to_string())
-                .collect::<Vec<_>>()
-        };
-
-        let pk_col = client.get_table_pk_or_inferred(table)?.ok_or_else(|| {
-            AppError::Backend(format!(
-                "Table '{table}' has no rows and no primary key metadata"
-            ))
-        })?;
-        let mode = client.get_table_mode(table)?;
-        let where_cond = parse_where(&upper, q);
-        let order_by = parse_order_by(&upper, q);
-        let need_full_scan = where_cond
-            .as_ref()
-            .is_some_and(|(col, _, _)| col != &pk_col)
-            || order_by.is_some();
-
-        let skip = usize::try_from((page.saturating_sub(1)) * page_size)
-            .ok()
-            .map_or(0, |n| n);
-        let take_n = usize::try_from(page_size).ok().map_or(usize::MAX, |n| n);
-
-        let (total_count, has_more_override, page_result) = if need_full_scan {
-            let all_keys = client.list_row_keys(table)?;
-            let mut rows_with_pk: Vec<(String, Vec<JsonValue>)> = Vec::new();
-            for pk in &all_keys {
-                let row_values: Vec<JsonValue> = match mode {
-                    RowStorageMode::Json => {
-                        let opt = client.get_row_json(table, pk)?;
-                        let Some(obj) = opt.and_then(|v| v.as_object().cloned()) else {
-                            continue;
-                        };
-                        row_values_for_columns(&columns, pk, None, Some(&obj))
-                    }
-                    RowStorageMode::Hash => {
-                        let opt = client.get_row_hash(table, pk)?;
-                        let Some(map) = opt.as_ref() else {
-                            continue;
-                        };
-                        row_values_for_columns(&columns, pk, Some(map), None)
-                    }
-                };
-                let col_index = where_cond
-                    .as_ref()
-                    .and_then(|(col, _, _)| columns.iter().position(|c| c == col));
-                let matches = match (&where_cond, col_index) {
-                    (Some((_col, negate, val)), Some(idx)) => {
-                        let cell_str = match mode {
-                            RowStorageMode::Json => json_value_to_cmp_str(&row_values[idx]),
-                            RowStorageMode::Hash => {
-                                row_values[idx].as_str().unwrap_or("").to_string()
-                            }
-                        };
-                        let eq = cell_str == *val;
-                        if *negate {
-                            !eq
-                        } else {
-                            eq
-                        }
-                    }
-                    (Some((col, negate, val)), None) if col == &pk_col => {
-                        let eq = pk == val;
-                        if *negate {
-                            !eq
-                        } else {
-                            eq
-                        }
-                    }
-                    (None, _) => true,
-                    _ => false,
-                };
-                if matches {
-                    rows_with_pk.push((pk.clone(), row_values));
-                }
-            }
-            if let Some((col, asc)) = &order_by {
-                if let Some(idx) = columns.iter().position(|c| c == col) {
-                    rows_with_pk.sort_by(|a, b| {
-                        let a_str = json_value_to_cmp_str(&a.1[idx]);
-                        let b_str = json_value_to_cmp_str(&b.1[idx]);
-                        let ord = a_str.cmp(&b_str);
-                        if *asc {
-                            ord
-                        } else {
-                            ord.reverse()
-                        }
-                    });
-                }
-            }
-            let total = rows_with_pk.len();
-            let offset = usize::try_from((page.saturating_sub(1)) * page_size)
-                .ok()
-                .map_or(0, |n| n);
-            let take_n = usize::try_from(page_size).ok().map_or(usize::MAX, |n| n);
-            let page_rows: Vec<Vec<JsonValue>> = rows_with_pk
-                .into_iter()
-                .skip(offset)
-                .take(take_n)
-                .map(|(_, row_values)| row_values)
-                .collect();
-            (total as u64, None, PageResult::Rows(page_rows))
-        } else if where_cond.is_none() {
-            let (page_keys, paged_has_more) = client.list_row_keys_paged(table, skip, take_n)?;
-            let total = if paged_has_more {
-                skip as u64 + (page_keys.len() as u64) + 1
-            } else {
-                skip as u64 + (page_keys.len() as u64)
-            };
-            (total, Some(paged_has_more), PageResult::Keys(page_keys))
-        } else {
-            let all_keys = client.list_row_keys(table)?;
-            let mut filtered_keys: Vec<String> = all_keys;
-            if let Some((col, negate, val)) = &where_cond {
-                if col == &pk_col {
-                    filtered_keys.retain(|k| {
-                        let eq = k == val;
-                        if *negate {
-                            !eq
-                        } else {
-                            eq
-                        }
-                    });
-                }
-            }
-            let total = filtered_keys.len();
-            let page_keys: Vec<String> =
-                filtered_keys.into_iter().skip(skip).take(take_n).collect();
-            (total as u64, None, PageResult::Keys(page_keys))
-        };
-
-        let rows: Vec<JsonValue> = match page_result {
-            PageResult::Rows(page_rows) => page_rows.into_iter().map(JsonValue::Array).collect(),
-            PageResult::Keys(keys_page) => {
-                let mut out = Vec::new();
-                for pk in keys_page {
-                    let row_values: Vec<JsonValue> = match mode {
-                        RowStorageMode::Json => {
-                            let opt = client.get_row_json(table, &pk)?;
-                            let Some(obj) = opt.and_then(|v| v.as_object().cloned()) else {
-                                continue;
-                            };
-                            row_values_for_columns(&columns, &pk, None, Some(&obj))
-                        }
-                        RowStorageMode::Hash => {
-                            let opt = client.get_row_hash(table, &pk)?;
-                            let Some(map) = opt.as_ref() else {
-                                continue;
-                            };
-                            row_values_for_columns(&columns, &pk, Some(map), None)
-                        }
-                    };
-                    out.push(JsonValue::Array(row_values));
-                }
-                out
-            }
-        };
-
-        let start = (page.saturating_sub(1)) * page_size;
-        let has_more =
-            has_more_override.unwrap_or_else(|| start + (rows.len() as u64) < total_count);
-        log::info!(
-            "execute_query: table={table} total_count={total_count} rows_returned={}",
-            rows.len()
-        );
-        serde_json::json!({
-            "columns": columns,
-            "rows": rows,
-            "affected_rows": 0u64,
-            "truncated": false,
-            "pagination": {
-                "page": page,
-                "page_size": page_size,
-                "total_rows": total_count,
-                "has_more": has_more
-            }
-        })
+        execute_select_parsed(client, &sel, page, page_size, start)?
     };
 
     if let Some(obj) = result.as_object_mut() {
@@ -872,4 +755,20 @@ pub fn execute_query(
         );
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::extract_wrapped_subquery;
+
+    #[test]
+    fn test_extract_wrapped_subquery() {
+        let wrapped = r#"(SELECT * FROM "__redis_keys__" WHERE id > 5 ORDER BY type DESC LIMIT 1000) AS limited_subset"#;
+        let inner = extract_wrapped_subquery(wrapped).expect("should extract");
+        assert!(inner.starts_with("SELECT * FROM"));
+        assert!(inner.contains("__redis_keys__"));
+        assert!(inner.contains("LIMIT 1000"));
+        assert!(extract_wrapped_subquery("SELECT * FROM t").is_none());
+        assert!(extract_wrapped_subquery("(invalid) AS x").is_none());
+    }
 }

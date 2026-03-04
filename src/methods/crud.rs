@@ -47,6 +47,16 @@ fn try_decode_key_raw(s: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
+/// Resolve key to bytes and whether the str API can be used (true = use key as &str for `TTL/set_string`).
+fn resolve_key_bytes(key: &str) -> Result<(Vec<u8>, bool), AppError> {
+    if let Some(decoded) = try_decode_key_raw(key) {
+        validate_virtual_key_bytes(&decoded)?;
+        return Ok((decoded, false));
+    }
+    validate_virtual_key(key)?;
+    Ok((key.as_bytes().to_vec(), true))
+}
+
 fn json_to_string(v: &JsonValue) -> String {
     match v {
         JsonValue::Null => String::new(),
@@ -213,149 +223,90 @@ fn update_virtual_value_by_type(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn update_record_virtual(
     client: &mut RedisClient,
     key: &str,
     column: &str,
     value: &JsonValue,
 ) -> Result<u64, AppError> {
-    let key_bytes_opt = try_decode_key_raw(key);
-    let use_bytes = key_bytes_opt
-        .as_ref()
-        .is_some_and(|b| validate_virtual_key_bytes(b).is_ok());
+    let (key_bytes, use_str_api) = resolve_key_bytes(key)?;
+    let key_bytes = key_bytes.as_slice();
 
-    if use_bytes {
-        let key_bytes = key_bytes_opt.as_ref().unwrap();
-        if column == "value" {
-            let key_type = client.key_type(key_bytes).map_err(AppError::Backend)?;
-            if key_type == "none" {
-                return Ok(0u64);
-            }
-            if key_type == "string" {
-                let s = json_to_string(value);
+    if column == "value" {
+        let key_type = client.key_type(key_bytes).map_err(AppError::Backend)?;
+        if key_type == "none" {
+            return Ok(0u64);
+        }
+        if key_type == "string" {
+            let s = json_to_string(value);
+            if use_str_api {
+                client.set_key_string(key, &s).map_err(AppError::Backend)?;
+            } else {
                 client
                     .set_key_bytes(key_bytes, s.as_bytes())
                     .map_err(AppError::Backend)?;
-                return Ok(1u64);
             }
-            return update_virtual_value_by_type(client, key_bytes, &key_type, value);
-        }
-        if column.starts_with("field:") {
-            let key_type = client.key_type(key_bytes).map_err(AppError::Backend)?;
-            if key_type != "hash" {
-                return Err(AppError::Unsupported(
-                    "field:<name> is only for hash keys".into(),
-                ));
-            }
-            let field = column.strip_prefix("field:").unwrap_or_default();
-            if field.is_empty() {
-                return Err(AppError::InvalidParams(
-                    "field: must be followed by field name".into(),
-                ));
-            }
-            let val = json_to_string(value);
-            client
-                .hset_field(key_bytes, field, &val)
-                .map_err(AppError::Backend)?;
             return Ok(1u64);
         }
-        if column.starts_with("index:") {
-            let key_type = client.key_type(key_bytes).map_err(AppError::Backend)?;
-            if key_type != "list" {
-                return Err(AppError::Unsupported(
-                    "index:<n> is only for list keys".into(),
-                ));
-            }
-            let index_str = column.strip_prefix("index:").unwrap_or_default();
-            let index: i64 = index_str
-                .parse()
-                .map_err(|_| AppError::InvalidParams("index must be a number".into()))?;
-            let val = json_to_string(value);
-            client
-                .lset(key_bytes, index, &val)
-                .map_err(AppError::Backend)?;
-            return Ok(1u64);
+        return update_virtual_value_by_type(client, key_bytes, &key_type, value);
+    }
+    if column.starts_with("field:") {
+        let key_type = client.key_type(key_bytes).map_err(AppError::Backend)?;
+        if key_type != "hash" {
+            return Err(AppError::Unsupported(
+                "field:<name> is only for hash keys".into(),
+            ));
         }
-        if column == "ttl_seconds" {
-            let s = json_to_string(value);
-            let n = s
-                .parse::<i64>()
-                .map_err(|_| AppError::InvalidParams("ttl_seconds must be an integer".into()))?;
-            if n == -1 {
+        let field = column.strip_prefix("field:").unwrap_or_default();
+        if field.is_empty() {
+            return Err(AppError::InvalidParams(
+                "field: must be followed by field name".into(),
+            ));
+        }
+        let val = json_to_string(value);
+        client
+            .hset_field(key_bytes, field, &val)
+            .map_err(AppError::Backend)?;
+        return Ok(1u64);
+    }
+    if column.starts_with("index:") {
+        let key_type = client.key_type(key_bytes).map_err(AppError::Backend)?;
+        if key_type != "list" {
+            return Err(AppError::Unsupported(
+                "index:<n> is only for list keys".into(),
+            ));
+        }
+        let index_str = column.strip_prefix("index:").unwrap_or_default();
+        let index: i64 = index_str
+            .parse()
+            .map_err(|_| AppError::InvalidParams("index must be a number".into()))?;
+        let val = json_to_string(value);
+        client
+            .lset(key_bytes, index, &val)
+            .map_err(AppError::Backend)?;
+        return Ok(1u64);
+    }
+    if column == "ttl_seconds" {
+        let s = json_to_string(value);
+        let n = s
+            .parse::<i64>()
+            .map_err(|_| AppError::InvalidParams("ttl_seconds must be an integer".into()))?;
+        if n == -1 {
+            if use_str_api {
+                client.persist_key(key).map_err(AppError::Backend)?;
+            } else {
                 client
                     .persist_key_bytes(key_bytes)
                     .map_err(AppError::Backend)?;
-            } else {
-                client
-                    .set_key_ttl_bytes(key_bytes, n)
-                    .map_err(AppError::Backend)?;
             }
-            return Ok(1u64);
-        }
-    } else {
-        validate_virtual_key(key)?;
-        let key_bytes = key.as_bytes();
-        if column == "value" {
-            let key_type = client.key_type(key_bytes).map_err(AppError::Backend)?;
-            if key_type == "none" {
-                return Ok(0u64);
-            }
-            if key_type == "string" {
-                let s = json_to_string(value);
-                client.set_key_string(key, &s).map_err(AppError::Backend)?;
-                return Ok(1u64);
-            }
-            return update_virtual_value_by_type(client, key_bytes, &key_type, value);
-        }
-        if column.starts_with("field:") {
-            let key_type = client.key_type(key_bytes).map_err(AppError::Backend)?;
-            if key_type != "hash" {
-                return Err(AppError::Unsupported(
-                    "field:<name> is only for hash keys".into(),
-                ));
-            }
-            let field = column.strip_prefix("field:").unwrap_or_default();
-            if field.is_empty() {
-                return Err(AppError::InvalidParams(
-                    "field: must be followed by field name".into(),
-                ));
-            }
-            let val = json_to_string(value);
+        } else if use_str_api {
+            client.set_key_ttl(key, n).map_err(AppError::Backend)?;
+        } else {
             client
-                .hset_field(key_bytes, field, &val)
+                .set_key_ttl_bytes(key_bytes, n)
                 .map_err(AppError::Backend)?;
-            return Ok(1u64);
         }
-        if column.starts_with("index:") {
-            let key_type = client.key_type(key_bytes).map_err(AppError::Backend)?;
-            if key_type != "list" {
-                return Err(AppError::Unsupported(
-                    "index:<n> is only for list keys".into(),
-                ));
-            }
-            let index_str = column.strip_prefix("index:").unwrap_or_default();
-            let index: i64 = index_str
-                .parse()
-                .map_err(|_| AppError::InvalidParams("index must be a number".into()))?;
-            let val = json_to_string(value);
-            client
-                .lset(key_bytes, index, &val)
-                .map_err(AppError::Backend)?;
-            return Ok(1u64);
-        }
-        if column == "ttl_seconds" {
-            let s = json_to_string(value);
-            let n = s
-                .parse::<i64>()
-                .map_err(|_| AppError::InvalidParams("ttl_seconds must be an integer".into()))?;
-            if n == -1 {
-                client.persist_key(key).map_err(AppError::Backend)?;
-            } else {
-                client.set_key_ttl(key, n).map_err(AppError::Backend)?;
-            }
-            return Ok(1u64);
-        }
+        return Ok(1u64);
     }
     Err(AppError::Unsupported(format!(
         "Column '{column}' is not editable on virtual key tables"
@@ -388,7 +339,7 @@ pub fn insert_record(
     if is_virtual_key_table(table) {
         return insert_record_virtual(client, data).map_err(|e| e.message().to_string());
     }
-    let pk_col = if let Some(pk) = client.get_table_pk(table)? {
+    let pk_col = if let Some(pk) = client.metadata().get_table_pk(table)? {
         pk
     } else {
         if data.is_empty() {
@@ -408,7 +359,9 @@ pub fn insert_record(
                 comment: None,
             })
             .collect();
-        client.register_table(table, &pk_col, &columns, "hash")?;
+        client
+            .metadata()
+            .register_table(table, &pk_col, &columns, RowStorageMode::Hash)?;
         pk_col
     };
     let pk_val = data
@@ -416,21 +369,21 @@ pub fn insert_record(
         .map(json_to_string)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("Primary key '{pk_col}' value missing in data"))?;
-    let mode = client.get_table_mode(table)?;
+    let mode = client.metadata().get_table_mode(table)?;
 
     match mode {
         RowStorageMode::Json => {
             let obj: serde_json::Map<String, JsonValue> =
                 data.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             let value = JsonValue::Object(obj);
-            client.set_row_json(table, &pk_val, &value)?;
+            client.metadata().set_row_json(table, &pk_val, &value)?;
         }
         RowStorageMode::Hash => {
             let mut map = HashMap::new();
             for (k, v) in data {
                 map.insert(k.clone(), json_to_string(v));
             }
-            client.set_row_hash(table, &pk_val, &map)?;
+            client.metadata().set_row_hash(table, &pk_val, &map)?;
         }
     }
     log::info!("insert_record: table={table} pk={pk_val}");
@@ -451,24 +404,26 @@ pub fn update_record(
     if is_virtual_key_table(table) {
         return update_record_virtual(client, &pk_str, column, value);
     }
-    let mode = client.get_table_mode(table)?;
+    let mode = client.metadata().get_table_mode(table)?;
 
     match mode {
         RowStorageMode::Json => {
-            let opt = client.get_row_json(table, &pk_str)?;
+            let opt = client.metadata().get_row_json(table, &pk_str)?;
             let Some(mut obj) = opt.and_then(|v| v.as_object().cloned()) else {
                 return Err(AppError::NotFound("Row not found".into()));
             };
             obj.insert(column.to_string(), value.clone());
-            client.set_row_json(table, &pk_str, &JsonValue::Object(obj))?;
+            client
+                .metadata()
+                .set_row_json(table, &pk_str, &JsonValue::Object(obj))?;
         }
         RowStorageMode::Hash => {
-            let opt = client.get_row_hash(table, &pk_str)?;
+            let opt = client.metadata().get_row_hash(table, &pk_str)?;
             let Some(mut map) = opt else {
                 return Err(AppError::NotFound("Row not found".into()));
             };
             map.insert(column.to_string(), json_to_string(value));
-            client.set_row_hash(table, &pk_str, &map)?;
+            client.metadata().set_row_hash(table, &pk_str, &map)?;
         }
     }
     log::info!("update_record: table={table} pk={pk_str} column={column}");
@@ -490,21 +445,93 @@ pub fn delete_record(
     if primary_key_column.is_empty() {
         return Err("Primary key column required".to_string());
     }
-    client.delete_row(table, &pk_str)?;
+    client.metadata().delete_row(table, &pk_str)?;
     log::info!("delete_record: table={table} pk={pk_str}");
     Ok(1u64)
 }
 
 pub fn insert_records_batch(
     client: &mut RedisClient,
-    schema: Option<&str>,
+    _schema: Option<&str>,
     table: &str,
     rows: &[serde_json::Map<String, JsonValue>],
 ) -> Result<u64, String> {
-    let mut total = 0u64;
-    for data in rows {
-        let n = insert_record(client, schema, table, data)?;
-        total += n;
+    if is_virtual_key_table(table) {
+        let mut total = 0u64;
+        for data in rows {
+            let n = insert_record_virtual(client, data).map_err(|e| e.message().to_string())?;
+            total += n;
+        }
+        log::info!(
+            "insert_records_batch: virtual table={table} rows={} total_affected={total}",
+            rows.len()
+        );
+        return Ok(total);
+    }
+    let pk_col = if let Some(pk) = client.metadata().get_table_pk(table)? {
+        pk
+    } else {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let first = &rows[0];
+        let col_names: Vec<String> = first.keys().cloned().collect();
+        let pk_col = col_names.first().cloned().unwrap_or_default();
+        let columns: Vec<crate::models::ColumnDef> = col_names
+            .iter()
+            .map(|name| crate::models::ColumnDef {
+                name: name.clone(),
+                data_type: "TEXT".to_string(),
+                is_nullable: true,
+                column_default: None,
+                is_primary_key: name == &pk_col,
+                is_auto_increment: false,
+                comment: None,
+            })
+            .collect();
+        client
+            .metadata()
+            .register_table(table, &pk_col, &columns, RowStorageMode::Hash)?;
+        pk_col
+    };
+    let mode = client.metadata().get_table_mode(table)?;
+    let total = rows.len() as u64;
+    match mode {
+        RowStorageMode::Hash => {
+            let batch: Vec<(String, HashMap<String, String>)> = rows
+                .iter()
+                .map(|data| {
+                    let pk_val = data
+                        .get(&pk_col)
+                        .map(json_to_string)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_default();
+                    let mut map = HashMap::new();
+                    for (k, v) in data {
+                        map.insert(k.clone(), json_to_string(v));
+                    }
+                    (pk_val, map)
+                })
+                .collect();
+            client.metadata().set_rows_hash_batch(table, &batch)?;
+        }
+        RowStorageMode::Json => {
+            let batch: Vec<(String, String)> = rows
+                .iter()
+                .map(|data| {
+                    let pk_val = data
+                        .get(&pk_col)
+                        .map(json_to_string)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_default();
+                    let obj: serde_json::Map<String, JsonValue> =
+                        data.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    let value = JsonValue::Object(obj);
+                    (pk_val, value.to_string())
+                })
+                .collect();
+            client.metadata().set_rows_json_batch(table, &batch)?;
+        }
     }
     log::info!(
         "insert_records_batch: table={table} rows={} total_affected={total}",
@@ -533,7 +560,7 @@ pub fn delete_records_batch(
         );
         return Ok(count);
     }
-    let count = client.delete_rows_batch(table, primary_keys)?;
+    let count = client.metadata().delete_rows_batch(table, primary_keys)?;
     log::info!(
         "delete_records_batch: table={table} pks={} deleted={count}",
         primary_keys.len()

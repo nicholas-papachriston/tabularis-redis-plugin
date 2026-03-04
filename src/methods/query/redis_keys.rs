@@ -11,13 +11,38 @@ use super::parser::{
 /// Max keys to scan when we need an accurate total (filters/order/pattern). Avoids OOM on huge DBs.
 const FULL_SCAN_SAFETY_CAP: u64 = 10_000_000;
 
+/// Max keys to count when we have a pattern (so we can show correct `total_rows` for __key tables). Count-only scan, no storage.
+const PATTERN_COUNT_CAP: u64 = 100_000;
+
+/// Count keys matching `pattern` via SCAN, without storing key data. Stops at `cap` to avoid long runs.
+fn count_keys_matching_pattern(
+    client: &mut RedisClient,
+    pattern: Option<&str>,
+    cap: u64,
+) -> Result<u64, String> {
+    let mut cursor = 0u64;
+    let mut count = 0u64;
+    loop {
+        let (next, keys) = client.scan_keys(cursor, 500, pattern)?;
+        count += u64::try_from(keys.len()).unwrap_or(u64::MAX);
+        if next == 0 {
+            break;
+        }
+        if count >= cap {
+            return Ok(cap);
+        }
+        cursor = next;
+    }
+    Ok(count)
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn execute_redis_keys_scan(
     client: &mut RedisClient,
     query: &str,
     page: u64,
     page_size: u64,
-    _app_limit: Option<u64>,
+    app_limit: Option<u64>,
     pattern_override: Option<&str>,
     json_path: Option<&str>,
 ) -> Result<JsonValue, String> {
@@ -48,31 +73,48 @@ pub fn execute_redis_keys_scan(
     log::debug!("execute_redis_keys_scan: query={query}");
 
     let dbsize = client.dbsize()?;
+    let page_size = page_size.max(1);
     let skip = usize::try_from((page.saturating_sub(1)) * page_size).unwrap_or(0);
-    let take = usize::try_from(page_size).unwrap_or(100);
+    let take = usize::try_from(page_size).unwrap_or(100).max(1);
+    let keys_needed = (skip + take) as u64;
     let need_full_scan =
         pattern.is_some() || type_filter.is_some() || order_by.is_some() || value_filter.is_some();
-    let max_to_scan: u64 = if need_full_scan {
-        FULL_SCAN_SAFETY_CAP
+    let pattern_total: Option<u64> = if pattern.is_some() {
+        let n = count_keys_matching_pattern(client, pattern.as_deref(), PATTERN_COUNT_CAP)?;
+        log::info!("execute_redis_keys_scan: pattern total (cap {PATTERN_COUNT_CAP}) = {n}");
+        Some(n)
     } else {
-        let keys_needed = (skip + take) as u64;
-        query_limit.map_or(keys_needed, |l| l.max(keys_needed))
+        None
+    };
+    let max_to_scan: u64 = {
+        let base = if need_full_scan {
+            FULL_SCAN_SAFETY_CAP
+        } else {
+            query_limit.map_or(keys_needed, |l| l.max(keys_needed))
+        };
+        let capped = app_limit.map_or(base, |cap| base.min(cap));
+        capped.max(keys_needed)
     };
     let mut all_keys: Vec<Arc<Vec<u8>>> = Vec::new();
     let mut cursor = 0u64;
+    let mut scan_exhausted = false;
+    let mut scan_capped = false;
     loop {
         let (next, keys) = client.scan_keys(cursor, 200, pattern.as_deref())?;
         for k in keys {
             if (all_keys.len() as u64) >= max_to_scan {
+                scan_capped = true;
                 break;
             }
             all_keys.push(Arc::new(k));
         }
         if next == 0 {
+            scan_exhausted = true;
             break;
         }
         cursor = next;
         if (all_keys.len() as u64) >= max_to_scan {
+            scan_capped = true;
             break;
         }
         if !need_full_scan
@@ -85,6 +127,11 @@ pub fn execute_redis_keys_scan(
             break;
         }
     }
+
+    log::info!(
+        "execute_redis_keys_scan: skip={skip} take={take} keys_needed={keys_needed} max_to_scan={max_to_scan} all_keys_len={} dbsize={dbsize}",
+        all_keys.len()
+    );
 
     let (page_keys_owned, types_for_page, total_count) =
         if type_filter.is_some() || order_by_type || order_by_value || value_filter.is_some() {
@@ -109,8 +156,10 @@ pub fn execute_redis_keys_scan(
                 })
                 .collect();
             let (mut keys_with_types, mut value_previews) = if let Some(ref vf) = value_filter {
-                let key_refs2: Vec<&Vec<u8>> =
-                    keys_with_types.iter().map(|(k, _)| k.as_ref()).collect();
+                let key_refs2: Vec<&[u8]> = keys_with_types
+                    .iter()
+                    .map(|(k, _)| k.as_ref().as_slice())
+                    .collect();
                 let types2: Vec<String> = keys_with_types.iter().map(|(_, t)| t.clone()).collect();
                 let previews = client.key_value_preview_batch(&key_refs2, &types2, json_path)?;
                 let mut filtered: Vec<(Arc<Vec<u8>>, String)> =
@@ -118,12 +167,13 @@ pub fn execute_redis_keys_scan(
                 let mut filtered_previews: Vec<String> = Vec::with_capacity(keys_with_types.len());
                 for ((k, t), preview) in keys_with_types.into_iter().zip(previews) {
                     let matches = match vf {
-                        RedisValueFilterKind::Exact(s) => preview.eq_ignore_ascii_case(s),
+                        RedisValueFilterKind::Exact(s) => preview.eq_ignore_ascii_case(s.as_ref()),
                         RedisValueFilterKind::StartsWith(s) => {
+                            let s = s.as_ref();
                             preview.len() >= s.len() && preview[..s.len()].eq_ignore_ascii_case(s)
                         }
                         RedisValueFilterKind::Contains(s) => {
-                            preview.to_lowercase().contains(&s.to_lowercase())
+                            preview.to_lowercase().contains(&s.as_ref().to_lowercase())
                         }
                     };
                     if matches {
@@ -136,8 +186,10 @@ pub fn execute_redis_keys_scan(
                 (keys_with_types, None)
             };
             if order_by_value && value_previews.is_none() {
-                let key_refs2: Vec<&Vec<u8>> =
-                    keys_with_types.iter().map(|(k, _)| k.as_ref()).collect();
+                let key_refs2: Vec<&[u8]> = keys_with_types
+                    .iter()
+                    .map(|(k, _)| k.as_ref().as_slice())
+                    .collect();
                 let types2: Vec<String> = keys_with_types.iter().map(|(_, t)| t.clone()).collect();
                 value_previews =
                     Some(client.key_value_preview_batch(&key_refs2, &types2, json_path)?);
@@ -186,8 +238,15 @@ pub fn execute_redis_keys_scan(
             (page_keys_owned, types_for_page, total_count)
         } else {
             let total_count = match (query_limit, pattern.is_some()) {
-                (Some(_), _) | (None, true) => all_keys.len() as u64,
-                (None, false) => dbsize,
+                (Some(_), _) => all_keys.len() as u64,
+                (None, true) => pattern_total.unwrap_or(all_keys.len() as u64),
+                (None, false) => {
+                    if scan_exhausted {
+                        all_keys.len() as u64
+                    } else {
+                        dbsize
+                    }
+                }
             };
             all_keys.sort_by(|a, b| {
                 let ord = a.cmp(b);
@@ -202,22 +261,25 @@ pub fn execute_redis_keys_scan(
             (page_keys_owned, vec![], total_count)
         };
 
-    let page_keys: Vec<&Vec<u8>> = page_keys_owned.iter().map(Arc::as_ref).collect();
+    let page_key_slices: Vec<&[u8]> = page_keys_owned
+        .iter()
+        .map(Arc::as_ref)
+        .map(Vec::as_slice)
+        .collect();
     let (type_previews, ttls) = if types_for_page.is_empty() {
-        let tp = client.key_type_and_preview_batch(&page_keys, json_path)?;
-        let ttl_keys: Vec<&[u8]> = page_keys.iter().map(|k| k.as_slice()).collect();
-        let ttls = client.key_ttl_batch(&ttl_keys)?;
+        let tp = client.key_type_and_preview_batch(&page_key_slices, json_path)?;
+        let ttls = client.key_ttl_batch(&page_key_slices)?;
         (tp, ttls)
     } else {
-        let previews = client.key_value_preview_batch(&page_keys, &types_for_page, json_path)?;
-        let ttl_keys: Vec<&[u8]> = page_keys.iter().map(|k| k.as_slice()).collect();
-        let ttls = client.key_ttl_batch(&ttl_keys)?;
+        let previews =
+            client.key_value_preview_batch(&page_key_slices, &types_for_page, json_path)?;
+        let ttls = client.key_ttl_batch(&page_key_slices)?;
         let tp: Vec<(String, String)> = types_for_page.into_iter().zip(previews).collect();
         (tp, ttls)
     };
 
-    let mut rows: Vec<JsonValue> = Vec::with_capacity(page_keys.len());
-    for (i, key_bytes) in page_keys.iter().enumerate() {
+    let mut rows: Vec<JsonValue> = Vec::with_capacity(page_key_slices.len());
+    for (i, key_bytes) in page_key_slices.iter().enumerate() {
         let key_display = crate::redis_client::bytes_to_display(key_bytes);
         let key_raw = crate::redis_client::bytes_to_key_id(key_bytes);
         let (type_str, preview) = type_previews
@@ -236,9 +298,12 @@ pub fn execute_redis_keys_scan(
         ]));
     }
     let start = (page.saturating_sub(1)) * page_size;
-    let has_more = start + (rows.len() as u64) < total_count;
+    let has_more = scan_capped || (start + (rows.len() as u64) < total_count);
+    // Always return a numeric total_rows so the UI can compute total_pages (avoids "Page 1 of 0").
+    // When scan_capped, total_count is the number we scanned so far (lower bound).
+    let total_rows_value = JsonValue::Number(serde_json::Number::from(total_count));
     log::info!(
-        "execute_redis_keys_scan: pattern={:?} type_filter={:?} total_count={total_count} rows_returned={}",
+        "execute_redis_keys_scan: pattern={:?} type_filter={:?} total_count={total_count} rows_returned={} has_more={has_more}",
         pattern,
         type_filter,
         rows.len()
@@ -251,7 +316,7 @@ pub fn execute_redis_keys_scan(
         "pagination": {
             "page": page,
             "page_size": page_size,
-            "total_rows": total_count,
+            "total_rows": total_rows_value,
             "has_more": has_more
         }
     }))

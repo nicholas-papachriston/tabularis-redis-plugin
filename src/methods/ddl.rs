@@ -14,9 +14,10 @@ pub fn get_create_table_sql(
     table: &str,
 ) -> Result<JsonValue, AppError> {
     let columns = client
+        .metadata()
         .get_table_columns(table)?
         .ok_or_else(|| AppError::NotFound(format!("Table '{table}' not found")))?;
-    let pk = client.get_table_pk(table)?.unwrap_or_default();
+    let pk = client.metadata().get_table_pk(table)?.unwrap_or_default();
     let mut parts: Vec<String> = Vec::new();
     for c in &columns {
         let mut def = format!("{} {}", quote_ident(&c.name), c.data_type);
@@ -228,13 +229,13 @@ pub fn drop_index(
     if index_name.is_empty() {
         return Err(AppError::InvalidParams("index_name is required".into()));
     }
-    let mut indexes = client.get_table_indexes(table)?;
+    let mut indexes = client.metadata().get_table_indexes(table)?;
     let pos = indexes
         .iter()
         .position(|i| i.index_name == index_name)
         .ok_or_else(|| AppError::NotFound(format!("Index '{index_name}' does not exist")))?;
     indexes.remove(pos);
-    client.set_table_indexes(table, &indexes)?;
+    client.metadata().set_table_indexes(table, &indexes)?;
     log::info!("drop_index: removed index {index_name} from table {table}");
     Ok(JsonValue::Null)
 }
@@ -262,7 +263,10 @@ pub fn drop_table(
             "Cannot drop virtual table '{table}'"
         )));
     }
-    client.drop_table(table).map_err(AppError::Backend)?;
+    client
+        .metadata()
+        .drop_table(table)
+        .map_err(AppError::Backend)?;
     log::info!("drop_table: dropped table {table}");
     Ok(JsonValue::Null)
 }

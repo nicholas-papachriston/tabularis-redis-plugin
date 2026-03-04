@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "description": "Redis key-value store with Hash and RedisJSON row storage",
   "default_port": 6379,
-  "default_username": "",
+  "default_username": "default",
   "executable": "tabularis-redis-plugin",
   "icon": "icon.svg",
   "repository": "https://github.com/tabularis-plugins/tabularis-redis-plugin",
