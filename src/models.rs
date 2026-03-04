@@ -11,8 +11,14 @@ pub struct ConnectionParams {
     pub database: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
-    #[allow(dead_code)]
     pub ssl_mode: Option<String>,
+    pub tls: Option<bool>,
+    pub connect_timeout_ms: Option<u64>,
+    pub read_timeout_ms: Option<u64>,
+    pub write_timeout_ms: Option<u64>,
+    pub cluster_nodes: Option<Vec<String>>,
+    pub sentinel_master: Option<String>,
+    pub sentinel_nodes: Option<Vec<String>>,
 }
 
 impl ConnectionParams {
@@ -49,7 +55,53 @@ impl ConnectionParams {
                 .get("ssl_mode")
                 .and_then(|v| v.as_str())
                 .map(String::from),
+            tls: obj.get("tls").and_then(serde_json::Value::as_bool),
+            connect_timeout_ms: obj
+                .get("connect_timeout_ms")
+                .and_then(serde_json::Value::as_u64),
+            read_timeout_ms: obj
+                .get("read_timeout_ms")
+                .and_then(serde_json::Value::as_u64),
+            write_timeout_ms: obj
+                .get("write_timeout_ms")
+                .and_then(serde_json::Value::as_u64),
+            cluster_nodes: obj
+                .get("cluster_nodes")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                }),
+            sentinel_master: obj
+                .get("sentinel_master")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            sentinel_nodes: obj
+                .get("sentinel_nodes")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                }),
         }
+    }
+
+    /// True if TLS should be used (explicit tls: true or `ssl_mode` require/verify-full).
+    pub fn use_tls(&self) -> bool {
+        if self.tls == Some(true) {
+            return true;
+        }
+        let mode = match &self.ssl_mode {
+            Some(m) => m.as_str(),
+            None => return false,
+        };
+        let mode_lower: String = mode.chars().flat_map(char::to_lowercase).collect();
+        matches!(
+            mode_lower.as_str(),
+            "require" | "verify-full" | "verify-ca" | "prefer"
+        )
     }
 }
 

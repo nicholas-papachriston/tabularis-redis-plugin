@@ -2,6 +2,7 @@ use crate::metadata::RowStorageMode;
 use crate::methods::common::AppError;
 use crate::methods::discovery;
 use crate::redis_client::RedisClient;
+use base64::Engine;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
@@ -23,6 +24,29 @@ fn validate_virtual_key(key: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+fn validate_virtual_key_bytes(key: &[u8]) -> Result<(), AppError> {
+    if key.is_empty() {
+        return Err(AppError::InvalidParams("Key cannot be empty".into()));
+    }
+    if key.starts_with(TABULARIS_KEY_PREFIX.as_bytes()) {
+        return Err(AppError::Unsupported(
+            "Keys under tabularis: are reserved for plugin metadata".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Decode `key_raw` (Base64) for round-trip of binary keys. Returns None if not valid base64.
+fn try_decode_key_raw(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(s.as_bytes())
+        .ok()
+}
+
 fn json_to_string(v: &JsonValue) -> String {
     match v {
         JsonValue::Null => String::new(),
@@ -37,14 +61,42 @@ fn insert_record_virtual(
     client: &mut RedisClient,
     data: &serde_json::Map<String, JsonValue>,
 ) -> Result<u64, AppError> {
+    let value = data.get("value").map(json_to_string).unwrap_or_default();
+    let value_bytes = value.as_bytes();
+
+    if let Some(key_raw) = data
+        .get("key_raw")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    {
+        let key_bytes = try_decode_key_raw(key_raw)
+            .ok_or_else(|| AppError::InvalidParams("data.key_raw must be valid Base64".into()))?;
+        validate_virtual_key_bytes(&key_bytes)?;
+        client
+            .set_key_bytes(&key_bytes, value_bytes)
+            .map_err(AppError::Backend)?;
+        if let Some(ttl) = data.get("ttl_seconds") {
+            let s = json_to_string(ttl);
+            if let Ok(n) = s.parse::<i64>() {
+                let _ = client.set_key_ttl_bytes(&key_bytes, n);
+            }
+        }
+        log::info!("insert_record_virtual: key_raw (binary)");
+        return Ok(1u64);
+    }
+
     let key = data
         .get("key")
         .and_then(|v| v.as_str())
         .map(String::from)
-        .unwrap_or_default();
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::InvalidParams(
+                "data.key or data.key_raw is required and must be non-empty".into(),
+            )
+        })?;
     validate_virtual_key(key.trim())?;
     let key = key.trim().to_string();
-    let value = data.get("value").map(json_to_string).unwrap_or_default();
     client
         .set_key_string(&key, &value)
         .map_err(AppError::Backend)?;
@@ -58,39 +110,252 @@ fn insert_record_virtual(
     Ok(1u64)
 }
 
+fn update_virtual_value_by_type(
+    client: &mut RedisClient,
+    key_bytes: &[u8],
+    key_type: &str,
+    value: &JsonValue,
+) -> Result<u64, AppError> {
+    match key_type {
+        "string" => {
+            let s = json_to_string(value);
+            client
+                .set_key_bytes(key_bytes, s.as_bytes())
+                .map_err(AppError::Backend)?;
+            Ok(1u64)
+        }
+        "hash" => {
+            let obj = value.as_object().ok_or_else(|| {
+                AppError::InvalidParams("value must be a JSON object for hash type".into())
+            })?;
+            let mut map = HashMap::new();
+            for (k, v) in obj {
+                map.insert(k.clone(), json_to_string(v));
+            }
+            client
+                .hset_multiple(key_bytes, &map)
+                .map_err(AppError::Backend)?;
+            Ok(1u64)
+        }
+        "list" => {
+            let (index, val) = match value {
+                JsonValue::Object(o) => {
+                    let i = o
+                        .get("index")
+                        .and_then(serde_json::Value::as_i64)
+                        .ok_or_else(|| AppError::InvalidParams("value must have index for list type".into()))?;
+                    let v = o.get("value").map(json_to_string).unwrap_or_default();
+                    (i, v)
+                }
+                JsonValue::Array(a) if a.len() >= 2 => {
+                    let i = a[0].as_i64().unwrap_or(0);
+                    let v = json_to_string(&a[1]);
+                    (i, v)
+                }
+                _ => return Err(AppError::InvalidParams(
+                    "value must be { index: number, value: string } or [index, value] for list type".into(),
+                )),
+            };
+            client
+                .lset(key_bytes, index, &val)
+                .map_err(AppError::Backend)?;
+            Ok(1u64)
+        }
+        "set" => {
+            let members: Vec<String> = value
+                .as_array()
+                .ok_or_else(|| {
+                    AppError::InvalidParams(
+                        "value must be a JSON array of strings for set type".into(),
+                    )
+                })?
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            client
+                .sadd_members(key_bytes, &members)
+                .map_err(AppError::Backend)?;
+            Ok(1u64)
+        }
+        "zset" => {
+            let entries: Vec<(f64, String)> = value
+                .as_array()
+                .ok_or_else(|| {
+                    AppError::InvalidParams(
+                        "value must be a JSON array of [score, member] for zset type".into(),
+                    )
+                })?
+                .iter()
+                .filter_map(|v| {
+                    let arr = v.as_array()?;
+                    #[allow(clippy::cast_precision_loss)]
+                    let score = arr
+                        .first()?
+                        .as_f64()
+                        .or_else(|| arr.first()?.as_i64().map(|n| n as f64))?;
+                    let member = arr.get(1).map(json_to_string).unwrap_or_default();
+                    Some((score, member))
+                })
+                .collect();
+            if entries.is_empty() {
+                return Err(AppError::InvalidParams(
+                    "zset value must have at least one [score, member] pair".into(),
+                ));
+            }
+            client
+                .zadd_entries(key_bytes, &entries)
+                .map_err(AppError::Backend)?;
+            Ok(1u64)
+        }
+        _ => Err(AppError::Unsupported(format!(
+            "Updating value for type '{key_type}' is not supported",
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn update_record_virtual(
     client: &mut RedisClient,
     key: &str,
     column: &str,
     value: &JsonValue,
 ) -> Result<u64, AppError> {
-    validate_virtual_key(key)?;
-    if column == "value" {
-        let key_bytes = key.as_bytes();
-        let key_type = client.key_type(key_bytes).map_err(AppError::Backend)?;
-        if key_type == "none" {
-            return Ok(0u64);
+    let key_bytes_opt = try_decode_key_raw(key);
+    let use_bytes = key_bytes_opt
+        .as_ref()
+        .is_some_and(|b| validate_virtual_key_bytes(b).is_ok());
+
+    if use_bytes {
+        let key_bytes = key_bytes_opt.as_ref().unwrap();
+        if column == "value" {
+            let key_type = client.key_type(key_bytes).map_err(AppError::Backend)?;
+            if key_type == "none" {
+                return Ok(0u64);
+            }
+            if key_type == "string" {
+                let s = json_to_string(value);
+                client
+                    .set_key_bytes(key_bytes, s.as_bytes())
+                    .map_err(AppError::Backend)?;
+                return Ok(1u64);
+            }
+            return update_virtual_value_by_type(client, key_bytes, &key_type, value);
         }
-        if key_type == "string" {
-            let s = json_to_string(value);
-            client.set_key_string(key, &s).map_err(AppError::Backend)?;
+        if column.starts_with("field:") {
+            let key_type = client.key_type(key_bytes).map_err(AppError::Backend)?;
+            if key_type != "hash" {
+                return Err(AppError::Unsupported(
+                    "field:<name> is only for hash keys".into(),
+                ));
+            }
+            let field = column.strip_prefix("field:").unwrap_or_default();
+            if field.is_empty() {
+                return Err(AppError::InvalidParams(
+                    "field: must be followed by field name".into(),
+                ));
+            }
+            let val = json_to_string(value);
+            client
+                .hset_field(key_bytes, field, &val)
+                .map_err(AppError::Backend)?;
             return Ok(1u64);
         }
-        return Err(AppError::Unsupported(format!(
-            "Updating value for type '{key_type}' is not supported; only string keys are editable"
-        )));
-    }
-    if column == "ttl_seconds" {
-        let s = json_to_string(value);
-        let n = s
-            .parse::<i64>()
-            .map_err(|_| AppError::InvalidParams("ttl_seconds must be an integer".into()))?;
-        if n == -1 {
-            client.persist_key(key).map_err(AppError::Backend)?;
-        } else {
-            client.set_key_ttl(key, n).map_err(AppError::Backend)?;
+        if column.starts_with("index:") {
+            let key_type = client.key_type(key_bytes).map_err(AppError::Backend)?;
+            if key_type != "list" {
+                return Err(AppError::Unsupported(
+                    "index:<n> is only for list keys".into(),
+                ));
+            }
+            let index_str = column.strip_prefix("index:").unwrap_or_default();
+            let index: i64 = index_str
+                .parse()
+                .map_err(|_| AppError::InvalidParams("index must be a number".into()))?;
+            let val = json_to_string(value);
+            client
+                .lset(key_bytes, index, &val)
+                .map_err(AppError::Backend)?;
+            return Ok(1u64);
         }
-        return Ok(1u64);
+        if column == "ttl_seconds" {
+            let s = json_to_string(value);
+            let n = s
+                .parse::<i64>()
+                .map_err(|_| AppError::InvalidParams("ttl_seconds must be an integer".into()))?;
+            if n == -1 {
+                client
+                    .persist_key_bytes(key_bytes)
+                    .map_err(AppError::Backend)?;
+            } else {
+                client
+                    .set_key_ttl_bytes(key_bytes, n)
+                    .map_err(AppError::Backend)?;
+            }
+            return Ok(1u64);
+        }
+    } else {
+        validate_virtual_key(key)?;
+        let key_bytes = key.as_bytes();
+        if column == "value" {
+            let key_type = client.key_type(key_bytes).map_err(AppError::Backend)?;
+            if key_type == "none" {
+                return Ok(0u64);
+            }
+            if key_type == "string" {
+                let s = json_to_string(value);
+                client.set_key_string(key, &s).map_err(AppError::Backend)?;
+                return Ok(1u64);
+            }
+            return update_virtual_value_by_type(client, key_bytes, &key_type, value);
+        }
+        if column.starts_with("field:") {
+            let key_type = client.key_type(key_bytes).map_err(AppError::Backend)?;
+            if key_type != "hash" {
+                return Err(AppError::Unsupported(
+                    "field:<name> is only for hash keys".into(),
+                ));
+            }
+            let field = column.strip_prefix("field:").unwrap_or_default();
+            if field.is_empty() {
+                return Err(AppError::InvalidParams(
+                    "field: must be followed by field name".into(),
+                ));
+            }
+            let val = json_to_string(value);
+            client
+                .hset_field(key_bytes, field, &val)
+                .map_err(AppError::Backend)?;
+            return Ok(1u64);
+        }
+        if column.starts_with("index:") {
+            let key_type = client.key_type(key_bytes).map_err(AppError::Backend)?;
+            if key_type != "list" {
+                return Err(AppError::Unsupported(
+                    "index:<n> is only for list keys".into(),
+                ));
+            }
+            let index_str = column.strip_prefix("index:").unwrap_or_default();
+            let index: i64 = index_str
+                .parse()
+                .map_err(|_| AppError::InvalidParams("index must be a number".into()))?;
+            let val = json_to_string(value);
+            client
+                .lset(key_bytes, index, &val)
+                .map_err(AppError::Backend)?;
+            return Ok(1u64);
+        }
+        if column == "ttl_seconds" {
+            let s = json_to_string(value);
+            let n = s
+                .parse::<i64>()
+                .map_err(|_| AppError::InvalidParams("ttl_seconds must be an integer".into()))?;
+            if n == -1 {
+                client.persist_key(key).map_err(AppError::Backend)?;
+            } else {
+                client.set_key_ttl(key, n).map_err(AppError::Backend)?;
+            }
+            return Ok(1u64);
+        }
     }
     Err(AppError::Unsupported(format!(
         "Column '{column}' is not editable on virtual key tables"
@@ -98,6 +363,15 @@ fn update_record_virtual(
 }
 
 fn delete_record_virtual(client: &mut RedisClient, key: &str) -> Result<u64, AppError> {
+    if let Some(key_bytes) = try_decode_key_raw(key) {
+        if validate_virtual_key_bytes(&key_bytes).is_ok() {
+            let n = client
+                .del_key_bytes(&key_bytes)
+                .map_err(AppError::Backend)?;
+            log::info!("delete_record_virtual: key_raw (binary) deleted={n}");
+            return Ok(n);
+        }
+    }
     validate_virtual_key(key)?;
     let n = client.del_key(key).map_err(AppError::Backend)?;
     log::info!("delete_record_virtual: key={key} deleted={n}");
@@ -219,4 +493,84 @@ pub fn delete_record(
     client.delete_row(table, &pk_str)?;
     log::info!("delete_record: table={table} pk={pk_str}");
     Ok(1u64)
+}
+
+pub fn insert_records_batch(
+    client: &mut RedisClient,
+    schema: Option<&str>,
+    table: &str,
+    rows: &[serde_json::Map<String, JsonValue>],
+) -> Result<u64, String> {
+    let mut total = 0u64;
+    for data in rows {
+        let n = insert_record(client, schema, table, data)?;
+        total += n;
+    }
+    log::info!(
+        "insert_records_batch: table={table} rows={} total_affected={total}",
+        rows.len()
+    );
+    Ok(total)
+}
+
+pub fn delete_records_batch(
+    client: &mut RedisClient,
+    _schema: Option<&str>,
+    table: &str,
+    primary_keys: &[String],
+) -> Result<u64, String> {
+    if primary_keys.is_empty() {
+        return Ok(0);
+    }
+    if is_virtual_key_table(table) {
+        for key in primary_keys {
+            validate_virtual_key(key).map_err(|e| e.message().to_string())?;
+        }
+        let count = client.del_keys_batch(primary_keys)?;
+        log::info!(
+            "delete_records_batch: virtual table={table} keys={} deleted={count}",
+            primary_keys.len()
+        );
+        return Ok(count);
+    }
+    let count = client.delete_rows_batch(table, primary_keys)?;
+    log::info!(
+        "delete_records_batch: table={table} pks={} deleted={count}",
+        primary_keys.len()
+    );
+    Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::methods::common::AppError;
+    use base64::Engine;
+
+    #[test]
+    fn validate_virtual_key_empty() {
+        let r = super::validate_virtual_key("");
+        assert!(matches!(r, Err(AppError::InvalidParams(_))));
+    }
+
+    #[test]
+    fn validate_virtual_key_tabularis_reserved() {
+        let r = super::validate_virtual_key("tabularis:foo");
+        assert!(matches!(r, Err(AppError::Unsupported(_))));
+    }
+
+    #[test]
+    fn validate_virtual_key_ok() {
+        assert!(super::validate_virtual_key("user:1").is_ok());
+        assert!(super::validate_virtual_key("batch:abc").is_ok());
+    }
+
+    #[test]
+    fn try_decode_key_raw() {
+        let raw = b"hello";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+        let decoded = super::try_decode_key_raw(&encoded).unwrap();
+        assert_eq!(decoded.as_slice(), raw);
+        assert!(super::try_decode_key_raw("not-base64!!").is_none());
+        assert!(super::try_decode_key_raw("").is_none());
+    }
 }

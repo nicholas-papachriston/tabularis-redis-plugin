@@ -44,11 +44,19 @@ pub fn get_add_column_sql(
     _schema: Option<&str>,
     table: &str,
     column: &JsonValue,
-) -> JsonValue {
-    let name = column.get("name").and_then(|v| v.as_str()).unwrap_or("");
+) -> Result<JsonValue, AppError> {
+    if table.is_empty() {
+        return Err(AppError::InvalidParams("table is required".into()));
+    }
+    let name = column
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::InvalidParams("column.name is required".into()))?;
     let data_type = column
         .get("data_type")
         .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
         .unwrap_or("TEXT");
     let nullable = column
         .get("is_nullable")
@@ -67,7 +75,7 @@ pub fn get_add_column_sql(
     if let Some(d) = default {
         let _ = write!(sql, " DEFAULT {d}");
     }
-    JsonValue::String(sql)
+    Ok(JsonValue::String(sql))
 }
 
 pub fn get_alter_column_sql(
@@ -75,11 +83,19 @@ pub fn get_alter_column_sql(
     _schema: Option<&str>,
     table: &str,
     column: &JsonValue,
-) -> JsonValue {
-    let name = column.get("name").and_then(|v| v.as_str()).unwrap_or("");
+) -> Result<JsonValue, AppError> {
+    if table.is_empty() {
+        return Err(AppError::InvalidParams("table is required".into()));
+    }
+    let name = column
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::InvalidParams("column.name is required".into()))?;
     let data_type = column
         .get("data_type")
         .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
         .unwrap_or("TEXT");
     let nullable = column
         .get("is_nullable")
@@ -94,7 +110,7 @@ pub fn get_alter_column_sql(
     if !nullable {
         sql.push_str(" NOT NULL");
     }
-    JsonValue::String(sql)
+    Ok(JsonValue::String(sql))
 }
 
 pub fn get_create_index_sql(
@@ -102,22 +118,35 @@ pub fn get_create_index_sql(
     _schema: Option<&str>,
     table: &str,
     index: &JsonValue,
-) -> JsonValue {
+) -> Result<JsonValue, AppError> {
+    if table.is_empty() {
+        return Err(AppError::InvalidParams("table is required".into()));
+    }
     let name = index
         .get("index_name")
         .or_else(|| index.get("name"))
         .and_then(|v| v.as_str())
-        .unwrap_or("idx");
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AppError::InvalidParams("index.index_name or index.name is required".into())
+        })?;
     let cols = index
         .get("columns")
         .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(quote_ident))
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| {
+            AppError::InvalidParams("index.columns (non-empty array) is required".into())
+        })?;
+    let cols_str: String = cols
+        .iter()
+        .filter_map(|v| v.as_str().map(quote_ident))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if cols_str.is_empty() {
+        return Err(AppError::InvalidParams(
+            "index.columns must contain at least one column name".into(),
+        ));
+    }
     let unique = index
         .get("is_unique")
         .and_then(serde_json::Value::as_bool)
@@ -128,9 +157,9 @@ pub fn get_create_index_sql(
         u,
         quote_ident(name),
         quote_ident(table),
-        cols
+        cols_str
     );
-    JsonValue::String(sql)
+    Ok(JsonValue::String(sql))
 }
 
 pub fn get_create_foreign_key_sql(
@@ -138,27 +167,38 @@ pub fn get_create_foreign_key_sql(
     _schema: Option<&str>,
     table: &str,
     fk: &JsonValue,
-) -> JsonValue {
+) -> Result<JsonValue, AppError> {
+    if table.is_empty() {
+        return Err(AppError::InvalidParams("table is required".into()));
+    }
     let name = fk
         .get("constraint_name")
         .or_else(|| fk.get("name"))
         .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
         .unwrap_or("fk");
     let column = fk
         .get("column_name")
         .or_else(|| fk.get("column"))
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::InvalidParams("fk.column_name or fk.column is required".into()))?;
     let ref_table = fk
         .get("referenced_table")
         .or_else(|| fk.get("ref_table"))
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AppError::InvalidParams("fk.referenced_table or fk.ref_table is required".into())
+        })?;
     let ref_column = fk
         .get("referenced_column")
         .or_else(|| fk.get("ref_column"))
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AppError::InvalidParams("fk.referenced_column or fk.ref_column is required".into())
+        })?;
     let on_delete = fk.get("on_delete").and_then(|v| v.as_str());
     let on_update = fk.get("on_update").and_then(|v| v.as_str());
     let mut sql = format!(
@@ -175,7 +215,7 @@ pub fn get_create_foreign_key_sql(
     if let Some(a) = on_update {
         let _ = write!(sql, " ON UPDATE {a}");
     }
-    JsonValue::String(sql)
+    Ok(JsonValue::String(sql))
 }
 
 pub fn drop_index(

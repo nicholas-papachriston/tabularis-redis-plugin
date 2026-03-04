@@ -1,5 +1,5 @@
 use crate::models::{ColumnDef, IndexDef};
-use redis::Connection;
+use redis::ConnectionLike;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
@@ -29,12 +29,26 @@ impl RowStorageMode {
     }
 }
 
-pub struct MetadataStore<'a> {
-    conn: &'a mut Connection,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_storage_mode_from_str() {
+        assert_eq!(RowStorageMode::from_str("json"), RowStorageMode::Json);
+        assert_eq!(RowStorageMode::from_str("JSON"), RowStorageMode::Json);
+        assert_eq!(RowStorageMode::from_str("hash"), RowStorageMode::Hash);
+        assert_eq!(RowStorageMode::from_str("Hash"), RowStorageMode::Hash);
+        assert_eq!(RowStorageMode::from_str("other"), RowStorageMode::Hash);
+    }
 }
 
-impl<'a> MetadataStore<'a> {
-    pub const fn new(conn: &'a mut Connection) -> Self {
+pub struct MetadataStore<'a, C: ConnectionLike> {
+    conn: &'a mut C,
+}
+
+impl<'a, C: ConnectionLike> MetadataStore<'a, C> {
+    pub const fn new(conn: &'a mut C) -> Self {
         Self { conn }
     }
 
@@ -190,13 +204,25 @@ impl<'a> MetadataStore<'a> {
         Ok((next, batch))
     }
 
+    /// Maximum row keys to load into memory to avoid OOM on very large tables.
+    const MAX_ROW_KEYS: usize = 500_000;
+
     pub fn list_row_keys(&mut self, table: &str) -> Result<Vec<String>, String> {
         const CHUNK: usize = 500;
         let mut cursor = 0u64;
         let mut out = Vec::new();
         loop {
             let (next, batch) = self.scan_row_keys(table, cursor, CHUNK)?;
-            out.extend(batch);
+            for k in batch {
+                if out.len() >= Self::MAX_ROW_KEYS {
+                    log::warn!(
+                        "list_row_keys: table {table} hit safety cap {} keys, stopping scan",
+                        Self::MAX_ROW_KEYS
+                    );
+                    return Ok(out);
+                }
+                out.push(k);
+            }
             if next == 0 {
                 break;
             }
@@ -326,8 +352,28 @@ impl<'a> MetadataStore<'a> {
         Ok(())
     }
 
+    /// Delete multiple rows in chunked pipelines. Returns the number of rows deleted.
+    pub fn delete_rows_batch(&mut self, table: &str, pks: &[String]) -> Result<u64, String> {
+        const CHUNK: usize = 500;
+        if pks.is_empty() {
+            return Ok(0);
+        }
+        let keys_set = Self::data_keys_set(table);
+        for chunk in pks.chunks(CHUNK) {
+            let mut pipe = redis::pipe();
+            for pk in chunk {
+                let key = Self::data_key(table, pk);
+                pipe.cmd("DEL").arg(&key).ignore();
+                pipe.cmd("SREM").arg(&keys_set).arg(pk).ignore();
+            }
+            pipe.query::<()>(self.conn).map_err(|e| e.to_string())?;
+        }
+        Ok(pks.len() as u64)
+    }
+
     /// Remove a table from the registry and delete all its data and metadata. Fails if the table is not in the registry.
     pub fn drop_table(&mut self, table: &str) -> Result<(), String> {
+        const CHUNK: usize = 500;
         let tables_key = Self::meta_tables_key();
         let is_member: u8 = redis::cmd("SISMEMBER")
             .arg(&tables_key)
@@ -341,11 +387,17 @@ impl<'a> MetadataStore<'a> {
         }
 
         let pks = self.list_row_keys(table)?;
-        for pk in &pks {
-            self.delete_row(table, pk)?;
+        let keys_set = Self::data_keys_set(table);
+        for chunk in pks.chunks(CHUNK) {
+            let mut pipe = redis::pipe();
+            for pk in chunk {
+                let key = Self::data_key(table, pk);
+                pipe.cmd("DEL").arg(&key).ignore();
+                pipe.cmd("SREM").arg(&keys_set).arg(pk).ignore();
+            }
+            pipe.query::<()>(self.conn).map_err(|e| e.to_string())?;
         }
 
-        let keys_set = Self::data_keys_set(table);
         redis::cmd("DEL")
             .arg(&keys_set)
             .query::<()>(self.conn)

@@ -5,8 +5,10 @@ mod crud;
 pub use common::AppError;
 mod ddl;
 mod discovery;
+mod pubsub;
 mod query;
 mod routines;
+mod server;
 mod views;
 
 use crate::methods::common::{
@@ -77,6 +79,12 @@ pub fn dispatch(
                 .map(|r| success_response(id, &r))
                 .map_err(AppError::Backend)
         }
+        "get_pubsub_channels" => pubsub::get_pubsub_channels(client)
+            .map(|r| success_response(id, &r))
+            .map_err(AppError::Backend),
+        "get_server_info" => server::get_server_info(client)
+            .map(|r| success_response(id, &r))
+            .map_err(AppError::Backend),
         "execute_query" => {
             let query = match required_str(params, "query") {
                 Ok(q) => q,
@@ -105,11 +113,56 @@ pub fn dispatch(
                 .map(|n| success_response(id, &serde_json::json!(n)))
                 .map_err(AppError::Backend)
         }
+        "insert_records_batch" => {
+            let table = match required_str(params, "table") {
+                Ok(t) => t,
+                Err(e) => return e.to_rpc_error(id),
+            };
+            let arr = params
+                .get("rows")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    AppError::InvalidParams("rows is required and must be an array".into())
+                });
+            let arr = match arr {
+                Ok(a) => a,
+                Err(e) => return e.to_rpc_error(id),
+            };
+            let rows: Vec<serde_json::Map<String, JsonValue>> =
+                arr.iter().filter_map(|v| v.as_object().cloned()).collect();
+            if rows.len() != arr.len() {
+                return AppError::InvalidParams("each element of rows must be an object".into())
+                    .to_rpc_error(id);
+            }
+            crud::insert_records_batch(client, schema_ref, &table, &rows)
+                .map(|n| success_response(id, &serde_json::json!(n)))
+                .map_err(AppError::Backend)
+        }
+        "delete_records_batch" => {
+            let table = match required_str(params, "table") {
+                Ok(t) => t,
+                Err(e) => return e.to_rpc_error(id),
+            };
+            let primary_keys = optional_array_of_str(params, "primary_keys");
+            crud::delete_records_batch(client, schema_ref, &table, &primary_keys)
+                .map(|n| success_response(id, &serde_json::json!(n)))
+                .map_err(AppError::Backend)
+        }
         "update_record" => {
-            let table = optional_str(params, "table").unwrap_or_default();
+            let table = match required_str(params, "table") {
+                Ok(t) => t,
+                Err(e) => return e.to_rpc_error(id),
+            };
             let pk_col = optional_str(params, "pk_col")
                 .or_else(|| optional_str(params, "primary_key_column"))
-                .unwrap_or_default();
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AppError::InvalidParams("pk_col or primary_key_column is required".into())
+                });
+            let pk_col = match pk_col {
+                Ok(c) => c,
+                Err(e) => return e.to_rpc_error(id),
+            };
             let pk_val = params
                 .get("pk_val")
                 .or_else(|| params.get("primary_key_value"))
@@ -117,7 +170,12 @@ pub fn dispatch(
                 .unwrap_or(JsonValue::Null);
             let column = optional_str(params, "col_name")
                 .or_else(|| optional_str(params, "column"))
-                .unwrap_or_default();
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| AppError::InvalidParams("col_name or column is required".into()));
+            let column = match column {
+                Ok(c) => c,
+                Err(e) => return e.to_rpc_error(id),
+            };
             let value = params
                 .get("new_val")
                 .or_else(|| params.get("value"))
@@ -129,10 +187,20 @@ pub fn dispatch(
             .map(|n| success_response(id, &serde_json::json!(n)))
         }
         "delete_record" => {
-            let table = optional_str(params, "table").unwrap_or_default();
+            let table = match required_str(params, "table") {
+                Ok(t) => t,
+                Err(e) => return e.to_rpc_error(id),
+            };
             let pk_col = optional_str(params, "pk_col")
                 .or_else(|| optional_str(params, "primary_key_column"))
-                .unwrap_or_default();
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AppError::InvalidParams("pk_col or primary_key_column is required".into())
+                });
+            let pk_col = match pk_col {
+                Ok(c) => c,
+                Err(e) => return e.to_rpc_error(id),
+            };
             let pk_val = params
                 .get("pk_val")
                 .or_else(|| params.get("primary_key_value"))
@@ -201,48 +269,78 @@ pub fn dispatch(
                 .map(|r| success_response(id, &r))
         }
         "get_create_table_sql" => {
-            let table = optional_str(params, "table").unwrap_or_default();
+            let table = match required_str(params, "table") {
+                Ok(t) => t,
+                Err(e) => return e.to_rpc_error(id),
+            };
             ddl::get_create_table_sql(client, schema_ref, &table).map(|r| success_response(id, &r))
         }
         "get_add_column_sql" => {
-            let table = optional_str(params, "table").unwrap_or_default();
+            let table = match required_str(params, "table") {
+                Ok(t) => t,
+                Err(e) => return e.to_rpc_error(id),
+            };
             let column = params.get("column").cloned().unwrap_or(JsonValue::Null);
-            let r = ddl::get_add_column_sql(client, schema_ref, &table, &column);
-            Ok(success_response(id, &r))
+            ddl::get_add_column_sql(client, schema_ref, &table, &column)
+                .map(|r| success_response(id, &r))
         }
         "get_alter_column_sql" => {
-            let table = optional_str(params, "table").unwrap_or_default();
+            let table = match required_str(params, "table") {
+                Ok(t) => t,
+                Err(e) => return e.to_rpc_error(id),
+            };
             let column = params.get("column").cloned().unwrap_or(JsonValue::Null);
-            let r = ddl::get_alter_column_sql(client, schema_ref, &table, &column);
-            Ok(success_response(id, &r))
+            ddl::get_alter_column_sql(client, schema_ref, &table, &column)
+                .map(|r| success_response(id, &r))
         }
         "get_create_index_sql" => {
-            let table = optional_str(params, "table").unwrap_or_default();
+            let table = match required_str(params, "table") {
+                Ok(t) => t,
+                Err(e) => return e.to_rpc_error(id),
+            };
             let index = params.get("index").cloned().unwrap_or(JsonValue::Null);
-            let r = ddl::get_create_index_sql(client, schema_ref, &table, &index);
-            Ok(success_response(id, &r))
+            ddl::get_create_index_sql(client, schema_ref, &table, &index)
+                .map(|r| success_response(id, &r))
         }
         "get_create_foreign_key_sql" => {
-            let table = optional_str(params, "table").unwrap_or_default();
+            let table = match required_str(params, "table") {
+                Ok(t) => t,
+                Err(e) => return e.to_rpc_error(id),
+            };
             let fk = params.get("fk").cloned().unwrap_or(JsonValue::Null);
-            let r = ddl::get_create_foreign_key_sql(client, schema_ref, &table, &fk);
-            Ok(success_response(id, &r))
+            ddl::get_create_foreign_key_sql(client, schema_ref, &table, &fk)
+                .map(|r: JsonValue| success_response(id, &r))
         }
         "drop_index" => {
-            let table = optional_str(params, "table").unwrap_or_default();
-            let index_name = optional_str(params, "index_name").unwrap_or_default();
+            let table = match required_str(params, "table") {
+                Ok(t) => t,
+                Err(e) => return e.to_rpc_error(id),
+            };
+            let index_name = match required_str(params, "index_name") {
+                Ok(n) => n,
+                Err(e) => return e.to_rpc_error(id),
+            };
             ddl::drop_index(client, schema_ref, &table, &index_name)
                 .map(|r| success_response(id, &r))
         }
         "drop_foreign_key" => {
-            let table = optional_str(params, "table").unwrap_or_default();
-            let constraint_name = optional_str(params, "constraint_name").unwrap_or_default();
+            let table = match required_str(params, "table") {
+                Ok(t) => t,
+                Err(e) => return e.to_rpc_error(id),
+            };
+            let constraint_name = match required_str(params, "constraint_name") {
+                Ok(n) => n,
+                Err(e) => return e.to_rpc_error(id),
+            };
             ddl::drop_foreign_key(client, schema_ref, &table, &constraint_name)
                 .map(|r| success_response(id, &r))
                 .map_err(AppError::Backend)
         }
         "drop_table" => {
-            let table = optional_str(params, "table").unwrap_or_default();
+            let table = match required_str(params, "table") {
+                Ok(t) => t,
+                Err(e) => return e.to_rpc_error(id),
+            };
             ddl::drop_table(client, schema_ref, &table).map(|r| success_response(id, &r))
         }
         _ => {

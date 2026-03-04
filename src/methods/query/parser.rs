@@ -293,3 +293,132 @@ pub fn parse_limit(upper: &str, q: &str) -> Option<u64> {
     let num: u64 = rest.split_whitespace().next()?.parse().ok()?;
     Some(num)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_where_eq() {
+        let q = "SELECT * FROM t WHERE key = 'x'";
+        let u = q.to_uppercase();
+        let r = super::parse_where(&u, q);
+        assert_eq!(r, Some(("key".to_string(), false, "x".to_string())));
+    }
+
+    #[test]
+    fn test_parse_order_by_asc_desc() {
+        let q = "SELECT * FROM t ORDER BY key ASC LIMIT 10";
+        let u = q.to_uppercase();
+        assert_eq!(
+            super::parse_order_by(&u, q),
+            Some(("key".to_string(), true))
+        );
+        let q2 = "SELECT * FROM t ORDER BY type DESC";
+        let u2 = q2.to_uppercase();
+        assert_eq!(
+            super::parse_order_by(&u2, q2),
+            Some(("type".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn test_parse_limit_num() {
+        let q = "SELECT * FROM t LIMIT 100";
+        let u = q.to_uppercase();
+        assert_eq!(super::parse_limit(&u, q), Some(100));
+    }
+
+    #[test]
+    fn test_parse_redis_keys_where_key_eq() {
+        let q = "SELECT * FROM __redis_keys__ WHERE key = 'batch'";
+        let u = q.to_uppercase();
+        assert_eq!(
+            super::parse_redis_keys_where(&u, q),
+            Some("batch*".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_redis_keys_where_key_like() {
+        let q = "SELECT * FROM __redis_keys__ WHERE key LIKE 'stress%'";
+        let u = q.to_uppercase();
+        assert_eq!(
+            super::parse_redis_keys_where(&u, q),
+            Some("stress*".to_string())
+        );
+        let q2 = "SELECT * FROM __redis_keys__ WHERE key LIKE '%mid%'";
+        let u2 = q2.to_uppercase();
+        assert_eq!(
+            super::parse_redis_keys_where(&u2, q2),
+            Some("*mid*".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_redis_keys_type_filter() {
+        let q = "SELECT * FROM __redis_keys__ WHERE type = 'hash'";
+        let u = q.to_uppercase();
+        assert_eq!(
+            super::parse_redis_keys_type_filter(&u, q),
+            Some(("hash".to_string(), false))
+        );
+        let q2 = "SELECT * FROM __redis_keys__ WHERE type != 'string'";
+        let u2 = q2.to_uppercase();
+        assert_eq!(
+            super::parse_redis_keys_type_filter(&u2, q2),
+            Some(("string".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn test_parse_redis_keys_order_by() {
+        let q = "SELECT * FROM __redis_keys__ ORDER BY value DESC";
+        let u = q.to_uppercase();
+        assert_eq!(
+            super::parse_redis_keys_order_by(&u, q),
+            Some(("value", true))
+        );
+    }
+
+    #[test]
+    fn test_parse_redis_keys_value_filter() {
+        let q = "SELECT * FROM __redis_keys__ WHERE value = 'foo'";
+        let u = q.to_uppercase();
+        match super::parse_redis_keys_value_filter(&u, q) {
+            Some(RedisValueFilterKind::Exact(s)) => assert_eq!(s, "foo"),
+            _ => panic!("expected Exact"),
+        }
+        let q2 = "SELECT * FROM __redis_keys__ WHERE value LIKE 'pre%'";
+        let u2 = q2.to_uppercase();
+        match super::parse_redis_keys_value_filter(&u2, q2) {
+            Some(RedisValueFilterKind::StartsWith(s)) => assert_eq!(s, "pre"),
+            _ => panic!("expected StartsWith"),
+        }
+    }
+
+    #[test]
+    fn test_json_value_to_cmp_str() {
+        assert_eq!(
+            super::json_value_to_cmp_str(&JsonValue::String("x".into())),
+            "x"
+        );
+        assert_eq!(
+            super::json_value_to_cmp_str(&JsonValue::Number(42i64.into())),
+            "42"
+        );
+        assert_eq!(super::json_value_to_cmp_str(&JsonValue::Null), "");
+    }
+
+    #[test]
+    fn test_row_values_for_columns_uses_pk_for_key() {
+        let cols = vec!["_key".to_string(), "name".to_string()];
+        let pk = "my-pk";
+        let mut map = HashMap::new();
+        map.insert("name".to_string(), "alice".to_string());
+        let out = super::row_values_for_columns(&cols, pk, Some(&map), None);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], JsonValue::String("my-pk".to_string()));
+        assert_eq!(out[1], JsonValue::String("alice".to_string()));
+    }
+}

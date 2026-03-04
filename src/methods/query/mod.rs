@@ -1,8 +1,11 @@
+mod aggregates;
 mod parser;
 mod redis_keys;
+mod sql_parser;
 
 use crate::metadata::RowStorageMode;
 use crate::methods::common::AppError;
+use crate::methods::crud;
 use crate::methods::ddl;
 use crate::methods::discovery;
 use crate::models::IndexDef;
@@ -14,6 +17,7 @@ use parser::{
     json_value_to_cmp_str, parse_order_by, parse_where, row_values_for_columns, PageResult,
 };
 use redis_keys::execute_redis_keys_scan;
+use sql_parser::{evaluate_where, parse_sql, ParsedStatement};
 
 /// Parse CREATE [UNIQUE] INDEX name ON table (col1, col2) and persist index metadata.
 fn execute_create_index(client: &mut RedisClient, q: &str) -> Result<JsonValue, AppError> {
@@ -87,6 +91,455 @@ fn execute_create_index(client: &mut RedisClient, q: &str) -> Result<JsonValue, 
     }))
 }
 
+/// Execute a SELECT that was parsed by sqlparser. Used for metadata tables (not virtual key tables).
+#[allow(clippy::too_many_lines)]
+fn execute_select_parsed(
+    client: &mut RedisClient,
+    sel: &sql_parser::SelectQuery,
+    page: u64,
+    page_size: u64,
+    start: std::time::Instant,
+) -> Result<JsonValue, AppError> {
+    let use_aggregates = !sel.aggregates.is_empty() || !sel.group_by.is_empty();
+    if use_aggregates {
+        return execute_select_aggregated(client, sel, page, page_size, start);
+    }
+
+    let table = sel.table.as_str();
+    let column_names: Vec<String> = if sel.columns.len() == 1 && sel.columns[0].name == "*" {
+        match client.get_table_columns(table)? {
+            Some(cols) if !cols.is_empty() => cols.into_iter().map(|x| x.name).collect(),
+            _ => client
+                .infer_columns_from_data(table)?
+                .map(|c| c.into_iter().map(|x| x.name).collect())
+                .unwrap_or_default(),
+        }
+    } else {
+        sel.columns.iter().map(|c| c.name.clone()).collect()
+    };
+    let output_columns: Vec<String> = if sel.columns.len() == 1 && sel.columns[0].name == "*" {
+        column_names.clone()
+    } else {
+        sel.columns
+            .iter()
+            .map(|c| c.alias.as_ref().unwrap_or(&c.name).clone())
+            .collect()
+    };
+    let _pk_col = client.get_table_pk_or_inferred(table)?.ok_or_else(|| {
+        AppError::Backend(format!(
+            "Table '{table}' has no rows and no primary key metadata"
+        ))
+    })?;
+    let mode = client.get_table_mode(table)?;
+    let need_full_scan = sel.where_clause.is_some() || !sel.order_by.is_empty();
+    let skip = usize::try_from((page.saturating_sub(1)) * page_size).unwrap_or(0);
+    let take_n = usize::try_from(page_size).unwrap_or(usize::MAX);
+    let sql_limit = sel.limit.map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+
+    let (total_count, page_rows) = if need_full_scan {
+        let all_keys = client.list_row_keys(table)?;
+        let mut rows_with_pk: Vec<(String, Vec<JsonValue>)> = Vec::new();
+        for pk in &all_keys {
+            let row_values: Vec<JsonValue> = match mode {
+                RowStorageMode::Json => {
+                    let opt = client.get_row_json(table, pk)?;
+                    let Some(obj) = opt.and_then(|v| v.as_object().cloned()) else {
+                        continue;
+                    };
+                    row_values_for_columns(&column_names, pk, None, Some(&obj))
+                }
+                RowStorageMode::Hash => {
+                    let opt = client.get_row_hash(table, pk)?;
+                    let Some(map) = opt.as_ref() else {
+                        continue;
+                    };
+                    row_values_for_columns(&column_names, pk, Some(map), None)
+                }
+            };
+            let matches = sel.where_clause.as_ref().is_none_or(|expr| {
+                let row_strs: Vec<String> = row_values.iter().map(json_value_to_cmp_str).collect();
+                evaluate_where(&column_names, &row_strs, expr)
+            });
+            if matches {
+                rows_with_pk.push((pk.clone(), row_values));
+            }
+        }
+        if let Some((ref col, asc)) = sel.order_by.first() {
+            if let Some(idx) = column_names.iter().position(|c| c == col) {
+                rows_with_pk.sort_by(|a, b| {
+                    let a_str = json_value_to_cmp_str(&a.1[idx]);
+                    let b_str = json_value_to_cmp_str(&b.1[idx]);
+                    let ord = a_str.cmp(&b_str);
+                    if *asc {
+                        ord
+                    } else {
+                        ord.reverse()
+                    }
+                });
+            }
+        }
+        if let Some(limit) = sql_limit {
+            rows_with_pk.truncate(limit);
+        }
+        let total = rows_with_pk.len();
+        let page_rows: Vec<Vec<JsonValue>> = rows_with_pk
+            .into_iter()
+            .skip(skip)
+            .take(take_n)
+            .map(|(_, r)| r)
+            .collect();
+        (total as u64, page_rows)
+    } else if sel.where_clause.is_none() {
+        let (page_keys, paged_has_more) = client.list_row_keys_paged(table, skip, take_n)?;
+        let total = if paged_has_more {
+            skip as u64 + (page_keys.len() as u64) + 1
+        } else {
+            skip as u64 + (page_keys.len() as u64)
+        };
+        let mut out = Vec::new();
+        for pk in &page_keys {
+            let row_values: Vec<JsonValue> = match mode {
+                RowStorageMode::Json => {
+                    let opt = client.get_row_json(table, pk)?;
+                    let Some(obj) = opt.and_then(|v| v.as_object().cloned()) else {
+                        continue;
+                    };
+                    row_values_for_columns(&column_names, pk, None, Some(&obj))
+                }
+                RowStorageMode::Hash => {
+                    let opt = client.get_row_hash(table, pk)?;
+                    let Some(map) = opt.as_ref() else {
+                        continue;
+                    };
+                    row_values_for_columns(&column_names, pk, Some(map), None)
+                }
+            };
+            out.push(row_values);
+        }
+        (total, out)
+    } else {
+        let all_keys = client.list_row_keys(table)?;
+        let mut filtered: Vec<String> = all_keys;
+        if let Some(ref expr) = sel.where_clause {
+            filtered.retain(|pk| {
+                let row_values: Vec<JsonValue> = match mode {
+                    RowStorageMode::Json => {
+                        let opt = client.get_row_json(table, pk).ok().flatten();
+                        let Some(obj) = opt.and_then(|v| v.as_object().cloned()) else {
+                            return false;
+                        };
+                        row_values_for_columns(&column_names, pk, None, Some(&obj))
+                    }
+                    RowStorageMode::Hash => {
+                        let opt = client.get_row_hash(table, pk).ok().flatten();
+                        let Some(map) = opt else {
+                            return false;
+                        };
+                        row_values_for_columns(&column_names, pk, Some(&map), None)
+                    }
+                };
+                let row_strs: Vec<String> = row_values.iter().map(json_value_to_cmp_str).collect();
+                evaluate_where(&column_names, &row_strs, expr)
+            });
+        }
+        if let Some(limit) = sql_limit {
+            filtered.truncate(limit);
+        }
+        let total = filtered.len();
+        let page_keys: Vec<String> = filtered.into_iter().skip(skip).take(take_n).collect();
+        let mut out = Vec::new();
+        for pk in &page_keys {
+            let row_values: Vec<JsonValue> = match mode {
+                RowStorageMode::Json => {
+                    let opt = client.get_row_json(table, pk)?;
+                    let Some(obj) = opt.and_then(|v| v.as_object().cloned()) else {
+                        continue;
+                    };
+                    row_values_for_columns(&column_names, pk, None, Some(&obj))
+                }
+                RowStorageMode::Hash => {
+                    let opt = client.get_row_hash(table, pk)?;
+                    let Some(map) = opt.as_ref() else {
+                        continue;
+                    };
+                    row_values_for_columns(&column_names, pk, Some(map), None)
+                }
+            };
+            out.push(row_values);
+        }
+        (total as u64, out)
+    };
+
+    let rows: Vec<JsonValue> = page_rows.into_iter().map(JsonValue::Array).collect();
+    let has_more = (page.saturating_sub(1)) * page_size + (rows.len() as u64) < total_count;
+    let mut result = serde_json::json!({
+        "columns": output_columns,
+        "rows": rows,
+        "affected_rows": 0u64,
+        "truncated": false,
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total_rows": total_count,
+            "has_more": has_more
+        }
+    });
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert(
+            "execution_time_ms".to_string(),
+            JsonValue::Number(serde_json::Number::from(
+                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            )),
+        );
+    }
+    Ok(result)
+}
+
+#[allow(dead_code)]
+fn execute_select_aggregated(
+    client: &mut RedisClient,
+    sel: &sql_parser::SelectQuery,
+    page: u64,
+    page_size: u64,
+    start: std::time::Instant,
+) -> Result<JsonValue, AppError> {
+    let table = sel.table.as_str();
+    let column_names: Vec<String> = match client.get_table_columns(table)? {
+        Some(cols) if !cols.is_empty() => cols.into_iter().map(|x| x.name).collect(),
+        _ => client
+            .infer_columns_from_data(table)?
+            .map(|c| c.into_iter().map(|x| x.name).collect())
+            .unwrap_or_default(),
+    };
+    let mode = client.get_table_mode(table)?;
+    let all_keys = client.list_row_keys(table)?;
+    let mut rows: Vec<Vec<JsonValue>> = Vec::new();
+    for pk in &all_keys {
+        let row_values: Vec<JsonValue> = match mode {
+            RowStorageMode::Json => {
+                let opt = client.get_row_json(table, pk)?;
+                let Some(obj) = opt.and_then(|v| v.as_object().cloned()) else {
+                    continue;
+                };
+                row_values_for_columns(&column_names, pk, None, Some(&obj))
+            }
+            RowStorageMode::Hash => {
+                let opt = client.get_row_hash(table, pk)?;
+                let Some(map) = opt.as_ref() else {
+                    continue;
+                };
+                row_values_for_columns(&column_names, pk, Some(map), None)
+            }
+        };
+        let matches = sel.where_clause.as_ref().is_none_or(|expr| {
+            let row_strs: Vec<String> = row_values.iter().map(json_value_to_cmp_str).collect();
+            evaluate_where(&column_names, &row_strs, expr)
+        });
+        if matches {
+            rows.push(row_values);
+        }
+    }
+    let (output_columns, agg_rows) =
+        aggregates::compute_aggregates(&column_names, &rows, &sel.group_by, &sel.aggregates);
+    let skip = usize::try_from((page.saturating_sub(1)) * page_size).unwrap_or(0);
+    let take_n = usize::try_from(page_size).unwrap_or(usize::MAX);
+    let total_count = agg_rows.len() as u64;
+    let rows_json: Vec<JsonValue> = agg_rows
+        .into_iter()
+        .skip(skip)
+        .take(take_n)
+        .map(JsonValue::Array)
+        .collect();
+    let has_more = (page.saturating_sub(1)) * page_size + (rows_json.len() as u64) < total_count;
+    let mut result = serde_json::json!({
+        "columns": output_columns,
+        "rows": rows_json,
+        "affected_rows": 0u64,
+        "truncated": false,
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total_rows": total_count,
+            "has_more": has_more
+        }
+    });
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert(
+            "execution_time_ms".to_string(),
+            JsonValue::Number(serde_json::Number::from(
+                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            )),
+        );
+    }
+    Ok(result)
+}
+
+fn execute_insert_parsed(
+    client: &mut RedisClient,
+    ins: &sql_parser::InsertQuery,
+    start: std::time::Instant,
+) -> Result<JsonValue, AppError> {
+    let table = ins.table.as_str();
+    let mut affected = 0u64;
+    for row in &ins.rows {
+        let mut data = serde_json::Map::new();
+        for (col, val) in ins.columns.iter().zip(row.iter()) {
+            data.insert(col.clone(), JsonValue::String(val.clone()));
+        }
+        let n = crud::insert_record(client, None, table, &data).map_err(AppError::Backend)?;
+        affected += n;
+    }
+    let mut result = serde_json::json!({
+        "columns": serde_json::Value::Array(vec![]),
+        "rows": serde_json::Value::Array(vec![]),
+        "affected_rows": affected,
+        "truncated": false
+    });
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert(
+            "execution_time_ms".to_string(),
+            JsonValue::Number(serde_json::Number::from(
+                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            )),
+        );
+    }
+    Ok(result)
+}
+
+fn execute_update_parsed(
+    client: &mut RedisClient,
+    upd: &sql_parser::UpdateQuery,
+    start: std::time::Instant,
+) -> Result<JsonValue, AppError> {
+    let table = upd.table.as_str();
+    let pk_col = client
+        .get_table_pk_or_inferred(table)?
+        .ok_or_else(|| AppError::Backend(format!("Table '{table}' has no primary key")))?;
+    let mode = client.get_table_mode(table)?;
+    let column_names = client.get_table_columns(table)?.map_or_else(
+        || upd.assignments.iter().map(|(k, _)| k.clone()).collect(),
+        |c| c.into_iter().map(|x| x.name).collect::<Vec<_>>(),
+    );
+    let all_keys = client.list_row_keys(table)?;
+    let mut affected = 0u64;
+    for pk in &all_keys {
+        let row_values: Vec<JsonValue> = match mode {
+            RowStorageMode::Json => {
+                let opt = client.get_row_json(table, pk)?;
+                let Some(obj) = opt.and_then(|v| v.as_object().cloned()) else {
+                    continue;
+                };
+                row_values_for_columns(&column_names, pk, None, Some(&obj))
+            }
+            RowStorageMode::Hash => {
+                let opt = client.get_row_hash(table, pk)?;
+                let Some(map) = opt.as_ref() else {
+                    continue;
+                };
+                row_values_for_columns(&column_names, pk, Some(map), None)
+            }
+        };
+        let row_strs: Vec<String> = row_values.iter().map(json_value_to_cmp_str).collect();
+        let matches = upd
+            .where_clause
+            .as_ref()
+            .is_none_or(|expr| sql_parser::evaluate_where(&column_names, &row_strs, expr));
+        if !matches {
+            continue;
+        }
+        let pk_value = JsonValue::String(pk.clone());
+        for (col, val) in &upd.assignments {
+            let n = crud::update_record(
+                client,
+                None,
+                table,
+                &pk_col,
+                &pk_value,
+                col,
+                &JsonValue::String(val.clone()),
+            )?;
+            affected += n;
+        }
+    }
+    let mut result = serde_json::json!({
+        "columns": serde_json::Value::Array(vec![]),
+        "rows": serde_json::Value::Array(vec![]),
+        "affected_rows": affected,
+        "truncated": false
+    });
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert(
+            "execution_time_ms".to_string(),
+            JsonValue::Number(serde_json::Number::from(
+                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            )),
+        );
+    }
+    Ok(result)
+}
+
+fn execute_delete_parsed(
+    client: &mut RedisClient,
+    del: &sql_parser::DeleteQuery,
+    start: std::time::Instant,
+) -> Result<JsonValue, AppError> {
+    let table = del.table.as_str();
+    let pk_col = client
+        .get_table_pk_or_inferred(table)?
+        .ok_or_else(|| AppError::Backend(format!("Table '{table}' has no primary key")))?;
+    let mode = client.get_table_mode(table)?;
+    let column_names = client
+        .get_table_columns(table)?
+        .map(|c| c.into_iter().map(|x| x.name).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let all_keys = client.list_row_keys(table)?;
+    let mut affected = 0u64;
+    for pk in &all_keys {
+        let row_values: Vec<JsonValue> = match mode {
+            RowStorageMode::Json => {
+                let opt = client.get_row_json(table, pk)?;
+                let Some(obj) = opt.and_then(|v| v.as_object().cloned()) else {
+                    continue;
+                };
+                row_values_for_columns(&column_names, pk, None, Some(&obj))
+            }
+            RowStorageMode::Hash => {
+                let opt = client.get_row_hash(table, pk)?;
+                let Some(map) = opt.as_ref() else {
+                    continue;
+                };
+                row_values_for_columns(&column_names, pk, Some(map), None)
+            }
+        };
+        let row_strs: Vec<String> = row_values.iter().map(json_value_to_cmp_str).collect();
+        let matches = del
+            .where_clause
+            .as_ref()
+            .is_none_or(|expr| sql_parser::evaluate_where(&column_names, &row_strs, expr));
+        if matches {
+            let n =
+                crud::delete_record(client, None, table, &pk_col, &JsonValue::String(pk.clone()))
+                    .map_err(AppError::Backend)?;
+            affected += n;
+        }
+    }
+    let mut result = serde_json::json!({
+        "columns": serde_json::Value::Array(vec![]),
+        "rows": serde_json::Value::Array(vec![]),
+        "affected_rows": affected,
+        "truncated": false
+    });
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert(
+            "execution_time_ms".to_string(),
+            JsonValue::Number(serde_json::Number::from(
+                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            )),
+        );
+    }
+    Ok(result)
+}
+
 /// Parse "DROP TABLE [IF EXISTS] `table_name`" and return the table name if matched.
 fn parse_drop_table(q: &str) -> Option<String> {
     let upper = q.trim().to_uppercase();
@@ -146,8 +599,31 @@ pub fn execute_query(
             "execution_time_ms": u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
         }));
     }
+
+    if let Ok(parsed) = parse_sql(q) {
+        match parsed {
+            ParsedStatement::Insert(ins) => {
+                return execute_insert_parsed(client, &ins, start);
+            }
+            ParsedStatement::Update(upd) => {
+                return execute_update_parsed(client, &upd, start);
+            }
+            ParsedStatement::Delete(del) => {
+                return execute_delete_parsed(client, &del, start);
+            }
+            _ => {}
+        }
+    }
+
     if !upper.starts_with("SELECT") {
         return Err(AppError::Backend("Only SELECT is supported".into()));
+    }
+
+    if let Ok(ParsedStatement::Select(ref sel)) = parse_sql(q) {
+        let table = sel.table.as_str();
+        if table != discovery::REDIS_KEYS_TABLE && !discovery::is_key_pattern_table(table) {
+            return execute_select_parsed(client, sel, page, page_size, start);
+        }
     }
 
     let from_idx = upper
@@ -173,24 +649,17 @@ pub fn execute_query(
         return Err(AppError::Backend("Missing table name after FROM".into()));
     }
 
-    let pattern_override = discovery::key_pattern_from_table(table).map(|p| format!("{p}:*"));
-    let pattern_override = pattern_override.or_else(|| {
-        if table.starts_with("__keys") && table != discovery::REDIS_KEYS_TABLE {
-            let rest = table
-                .strip_prefix("__keys")
-                .and_then(|s| s.strip_prefix(':'))
-                .unwrap_or_else(|| table.strip_prefix("__keys").unwrap_or(""));
-            let rest = rest.strip_suffix("__").unwrap_or(rest);
-            if rest.is_empty() {
-                None
-            } else {
-                Some(format!("{rest}:*"))
-            }
-        } else {
-            None
-        }
-    });
-    let mut result = if table == discovery::REDIS_KEYS_TABLE || pattern_override.is_some() {
+    let (is_virtual_table, pattern_override) = match discovery::virtual_table_scan_target(table) {
+        Some(discovery::VirtualScanTarget::AllKeys) => (true, None),
+        Some(discovery::VirtualScanTarget::Pattern(prefix)) => (true, Some(format!("{prefix}:*"))),
+        None => (false, None),
+    };
+    log::info!(
+        "execute_query: table={table} is_virtual={is_virtual_table} pattern_override={:?}",
+        pattern_override.as_deref()
+    );
+    log::debug!("execute_query: raw query={q}");
+    let mut result = if is_virtual_table {
         execute_redis_keys_scan(
             client,
             q,

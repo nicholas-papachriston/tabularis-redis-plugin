@@ -7,6 +7,9 @@
   "default_port": 6379,
   "default_username": "",
   "executable": "tabularis-redis-plugin",
+  "icon": "icon.svg",
+  "repository": "https://github.com/tabularis-plugins/tabularis-redis-plugin",
+  "homepage": "https://github.com/tabularis-plugins/tabularis-redis-plugin",
   "capabilities": {
     "schemas": false,
     "views": false,
@@ -18,7 +21,7 @@
     "auto_increment_keyword": "",
     "serial_type": "",
     "inline_pk": false,
-    "alter_column": false,
+    "alter_column": true,
     "create_foreign_keys": false
   },
   "data_types": [

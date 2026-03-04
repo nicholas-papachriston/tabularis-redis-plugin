@@ -70,3 +70,48 @@ pub fn page_request_from_params(params: &JsonValue) -> PageRequest {
 pub fn optional_json_path(params: &JsonValue) -> Option<&str> {
     params.get("json_path").and_then(|v| v.as_str())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::methods::common::AppError;
+
+    #[test]
+    fn test_required_str_present() {
+        let params = serde_json::json!({ "table": "t1" });
+        assert_eq!(super::required_str(&params, "table").unwrap(), "t1");
+    }
+
+    #[test]
+    fn test_required_str_missing() {
+        let params = serde_json::json!({});
+        let r = super::required_str(&params, "table");
+        assert!(matches!(r, Err(AppError::InvalidParams(_))));
+    }
+
+    #[test]
+    fn test_optional_str() {
+        let params = serde_json::json!({ "a": "x", "b": 1 });
+        assert_eq!(super::optional_str(&params, "a"), Some("x".to_string()));
+        assert_eq!(super::optional_str(&params, "b"), None);
+        assert_eq!(super::optional_str(&params, "c"), None);
+    }
+
+    #[test]
+    fn test_page_request_from_params_defaults() {
+        let params = serde_json::json!({});
+        let p = super::page_request_from_params(&params);
+        assert_eq!(p.page, DEFAULT_PAGE);
+        assert_eq!(p.page_size, DEFAULT_PAGE_SIZE);
+        assert_eq!(p.limit, None);
+    }
+
+    #[test]
+    fn test_page_request_from_params_uses_limit_as_page_size() {
+        let params = serde_json::json!({ "page": 2, "limit": 50 });
+        let p = super::page_request_from_params(&params);
+        assert_eq!(p.page, 2);
+        assert_eq!(p.page_size, 50);
+        assert_eq!(p.limit, Some(50));
+    }
+}

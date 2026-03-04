@@ -15,6 +15,29 @@ fn connection_key(params: &crate::models::ConnectionParams) -> String {
     format!("{host}:{port}/{db}")
 }
 
+/// Get a cached connection (validated with PING) or create a new one. Evicts stale entries.
+fn get_or_create_connection<'a>(
+    connections: &'a mut HashMap<String, RedisClient>,
+    key: &str,
+    conn_params: &crate::models::ConnectionParams,
+) -> Result<&'a mut RedisClient, String> {
+    loop {
+        let cached_ok = connections.get_mut(key).is_some_and(|c| c.ping().is_ok());
+        if cached_ok {
+            return Ok(connections.get_mut(key).expect("cached connection present"));
+        }
+        let had_cached = connections.contains_key(key);
+        connections.remove(key);
+        if had_cached {
+            log::warn!("Stale connection for key {key}, reconnecting");
+        }
+        log::debug!("No cached connection for key {key}, creating one");
+        let new_client = RedisClient::connect(conn_params)?;
+        log::info!("Created new Redis connection for key {key}");
+        connections.insert(key.to_string(), new_client);
+    }
+}
+
 /// Handle a single JSON-RPC request: resolve connection, dispatch method, return response.
 /// Caller is responsible for transport (read line, write response).
 pub fn handle_request(
@@ -39,28 +62,11 @@ pub fn handle_request(
     let key = connection_key(&conn_params);
     log::debug!("Handling method '{method}' for connection key {key}");
 
-    let client = if let Some(c) = connections.get_mut(&key) {
-        c
-    } else {
-        log::debug!("No cached connection for key {key}, creating one");
-        match RedisClient::connect(&conn_params) {
-            Ok(new_client) => {
-                log::info!("Created new Redis connection for key {key}");
-                connections.insert(key.clone(), new_client);
-                match connections.get_mut(&key) {
-                    Some(c) => c,
-                    None => {
-                        return crate::methods::AppError::Internal(
-                            "connection cache inconsistent".into(),
-                        )
-                        .to_rpc_error(id);
-                    }
-                }
-            }
-            Err(e) => {
-                log::warn!("Failed to connect for method '{method}', key {key}: {e}");
-                return crate::methods::AppError::Backend(e).to_rpc_error(id);
-            }
+    let client = match get_or_create_connection(connections, &key, &conn_params) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("Failed to connect for method '{method}', key {key}: {e}");
+            return crate::methods::AppError::Backend(e).to_rpc_error(id);
         }
     };
 

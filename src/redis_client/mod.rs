@@ -2,16 +2,105 @@ mod preview;
 
 use crate::metadata::{MetadataStore, RowStorageMode};
 use crate::models::{ColumnDef, ConnectionParams, IndexDef};
-use redis::Connection;
+use base64::Engine;
+use redis::cluster::ClusterClient;
+use redis::ConnectionLike;
+use redis::{Connection, Value as RedisValue};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use std::time::Duration;
+
+/// Abstraction over single-node and cluster connections so all commands go through `ConnectionLike`.
+#[allow(clippy::large_enum_variant)]
+pub enum RedisConn {
+    Single(Connection),
+    Cluster(Box<redis::cluster::ClusterConnection>),
+}
+
+impl redis::ConnectionLike for RedisConn {
+    fn req_packed_command(&mut self, cmd: &[u8]) -> redis::RedisResult<RedisValue> {
+        match self {
+            Self::Single(c) => c.req_packed_command(cmd),
+            Self::Cluster(c) => c.req_packed_command(cmd),
+        }
+    }
+
+    fn req_packed_commands(
+        &mut self,
+        cmd: &[u8],
+        offset: usize,
+        count: usize,
+    ) -> redis::RedisResult<Vec<redis::Value>> {
+        match self {
+            Self::Single(c) => c.req_packed_commands(cmd, offset, count),
+            Self::Cluster(c) => c.req_packed_commands(cmd, offset, count),
+        }
+    }
+
+    fn get_db(&self) -> i64 {
+        match self {
+            Self::Single(c) => c.get_db(),
+            Self::Cluster(c) => c.get_db(),
+        }
+    }
+
+    fn check_connection(&mut self) -> bool {
+        match self {
+            Self::Single(c) => c.check_connection(),
+            Self::Cluster(c) => c.check_connection(),
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        match self {
+            Self::Single(c) => c.is_open(),
+            Self::Cluster(c) => c.is_open(),
+        }
+    }
+}
 
 /// Convert bytes to a String, replacing invalid UTF-8 so JSON and the UI never see invalid sequences.
 pub fn bytes_to_display(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
+/// Lossless encoding of key bytes as Base64 for round-trip (e.g. binary keys in __`redis_keys`__).
+pub fn bytes_to_key_id(b: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+
+    #[test]
+    fn bytes_to_display_utf8() {
+        assert_eq!(bytes_to_display(b"hello"), "hello");
+    }
+
+    #[test]
+    fn bytes_to_display_invalid_utf8() {
+        let b = b"hi\xff\xfe";
+        let s = bytes_to_display(b);
+        assert!(s.contains("hi"));
+        assert!(s.len() > 2);
+    }
+
+    #[test]
+    fn bytes_to_key_id_roundtrip() {
+        let raw = b"binary\x00key";
+        let encoded = bytes_to_key_id(raw);
+        assert!(!encoded.is_empty());
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .unwrap();
+        assert_eq!(decoded.as_slice(), raw);
+    }
+}
+
 fn connection_string(params: &ConnectionParams) -> String {
+    let scheme = if params.use_tls() { "rediss" } else { "redis" };
     let host = params
         .host
         .as_deref()
@@ -32,29 +121,62 @@ fn connection_string(params: &ConnectionParams) -> String {
         (Some(user), None) => format!("{user}:@"),
         (None, None) => String::new(),
     };
-    format!("redis://{auth}{host}:{port}/{db}")
+    format!("{scheme}://{auth}{host}:{port}/{db}")
 }
 
 pub struct RedisClient {
-    conn: Connection,
+    conn: RedisConn,
     has_redis_json: bool,
 }
 
 impl RedisClient {
     pub fn connect(params: &ConnectionParams) -> Result<Self, String> {
-        let url = connection_string(params);
-        log::debug!("Connecting to Redis at {url}");
-        let client = redis::Client::open(url.as_str()).map_err(|e| e.to_string())?;
-        let mut conn = client.get_connection().map_err(|e| e.to_string())?;
-        let has_redis_json = Self::detect_redis_json(&mut conn);
-        log::info!("Redis connection established (redis_json_available={has_redis_json})");
+        let mut conn = if let Some(nodes) = params.cluster_nodes.as_ref().filter(|v| !v.is_empty())
+        {
+            log::debug!("Connecting to Redis Cluster with {} nodes", nodes.len());
+            let client = ClusterClient::new(nodes.iter().map(std::string::String::as_str))
+                .map_err(|e| e.to_string())?;
+            let cluster_conn = client.get_connection().map_err(|e| e.to_string())?;
+            log::info!("Redis Cluster connection established");
+            RedisConn::Cluster(Box::new(cluster_conn))
+        } else if let (Some(master), Some(sentinel_nodes)) = (
+            params.sentinel_master.as_deref(),
+            params.sentinel_nodes.as_ref(),
+        ) {
+            if sentinel_nodes.is_empty() {
+                return Err(
+                    "sentinel_nodes must be non-empty when sentinel_master is set".to_string(),
+                );
+            }
+            log::debug!("Connecting via Sentinel master={master}");
+            return Err("Redis Sentinel is not yet supported".to_string());
+        } else {
+            let url = connection_string(params);
+            log::debug!("Connecting to Redis at {url}");
+            let client = redis::Client::open(url.as_str()).map_err(|e| e.to_string())?;
+            let connect_timeout = Duration::from_millis(params.connect_timeout_ms.unwrap_or(5000));
+            let single_conn = client
+                .get_connection_with_timeout(connect_timeout)
+                .map_err(|e| e.to_string())?;
+            if let Some(ms) = params.read_timeout_ms.or(Some(10000)) {
+                let _ = single_conn.set_read_timeout(Some(Duration::from_millis(ms)));
+            }
+            if let Some(ms) = params.write_timeout_ms.or(Some(10000)) {
+                let _ = single_conn.set_write_timeout(Some(Duration::from_millis(ms)));
+            }
+            log::info!("Redis connection established");
+            RedisConn::Single(single_conn)
+        };
+
+        let has_redis_json = Self::detect_redis_json_connlike(&mut conn);
+        log::info!("redis_json_available={has_redis_json}");
         Ok(Self {
             conn,
             has_redis_json,
         })
     }
 
-    fn detect_redis_json(conn: &mut Connection) -> bool {
+    fn detect_redis_json_connlike(conn: &mut impl ConnectionLike) -> bool {
         let _: Result<(), _> = redis::cmd("MODULE").arg("LIST").query(conn);
         let r: Result<redis::Value, _> = redis::cmd("JSON.GET")
             .arg("__tabularis_no_key__")
@@ -245,6 +367,11 @@ impl RedisClient {
         MetadataStore::new(&mut self.conn).delete_row(table, pk)
     }
 
+    /// Delete multiple rows in chunked pipelines. Returns the number of rows deleted.
+    pub fn delete_rows_batch(&mut self, table: &str, pks: &[String]) -> Result<u64, String> {
+        MetadataStore::new(&mut self.conn).delete_rows_batch(table, pks)
+    }
+
     /// Remove a registered table and all its data and metadata. Fails if the table is not in the registry.
     pub fn drop_table(&mut self, table: &str) -> Result<(), String> {
         MetadataStore::new(&mut self.conn).drop_table(table)
@@ -266,8 +393,43 @@ impl RedisClient {
             .map_err(|e| e.to_string())
     }
 
+    /// Delete a key by raw bytes (for binary keys from `key_raw` round-trip).
+    pub fn del_key_bytes(&mut self, key: &[u8]) -> Result<u64, String> {
+        redis::cmd("DEL")
+            .arg(key)
+            .query(&mut self.conn)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Delete multiple keys in chunked pipelines. Returns total number of keys removed.
+    pub fn del_keys_batch(&mut self, keys: &[String]) -> Result<u64, String> {
+        const CHUNK: usize = 500;
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let mut total = 0u64;
+        for chunk in keys.chunks(CHUNK) {
+            let mut pipe = redis::pipe();
+            for k in chunk {
+                pipe.cmd("DEL").arg(k.as_str());
+            }
+            let results: Vec<u64> = pipe.query(&mut self.conn).map_err(|e| e.to_string())?;
+            total += results.iter().sum::<u64>();
+        }
+        Ok(total)
+    }
+
     /// Set a string key (raw Redis SET). Use for virtual key table CRUD.
     pub fn set_key_string(&mut self, key: &str, value: &str) -> Result<(), String> {
+        redis::cmd("SET")
+            .arg(key)
+            .arg(value)
+            .query(&mut self.conn)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Set a key by raw bytes (for binary keys from `key_raw` round-trip).
+    pub fn set_key_bytes(&mut self, key: &[u8], value: &[u8]) -> Result<(), String> {
         redis::cmd("SET")
             .arg(key)
             .arg(value)
@@ -296,6 +458,104 @@ impl RedisClient {
         Ok(())
     }
 
+    /// Set TTL for a key by raw bytes (binary keys from `key_raw`).
+    pub fn set_key_ttl_bytes(&mut self, key: &[u8], seconds: i64) -> Result<(), String> {
+        if seconds < 0 {
+            return self.persist_key_bytes(key);
+        }
+        redis::cmd("EXPIRE")
+            .arg(key)
+            .arg(seconds)
+            .query(&mut self.conn)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Remove TTL from a key by raw bytes (binary keys from `key_raw`).
+    pub fn persist_key_bytes(&mut self, key: &[u8]) -> Result<(), String> {
+        let _: i32 = redis::cmd("PERSIST")
+            .arg(key)
+            .query(&mut self.conn)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// HSET key field value. For virtual key table hash updates.
+    pub fn hset_field(&mut self, key: &[u8], field: &str, value: &str) -> Result<(), String> {
+        redis::cmd("HSET")
+            .arg(key)
+            .arg(field)
+            .arg(value)
+            .query(&mut self.conn)
+            .map_err(|e| e.to_string())
+    }
+
+    /// HSET key with multiple field-value pairs.
+    pub fn hset_multiple(
+        &mut self,
+        key: &[u8],
+        fields: &HashMap<String, String>,
+    ) -> Result<(), String> {
+        if fields.is_empty() {
+            return Ok(());
+        }
+        let mut cmd = redis::cmd("HSET");
+        cmd.arg(key);
+        for (k, v) in fields {
+            cmd.arg(k).arg(v);
+        }
+        cmd.query(&mut self.conn).map_err(|e| e.to_string())
+    }
+
+    /// LSET key index value. For virtual key table list updates.
+    pub fn lset(&mut self, key: &[u8], index: i64, value: &str) -> Result<(), String> {
+        redis::cmd("LSET")
+            .arg(key)
+            .arg(index)
+            .arg(value)
+            .query(&mut self.conn)
+            .map_err(|e| e.to_string())
+    }
+
+    /// SADD key member [member ...]. For virtual key table set updates.
+    pub fn sadd_members(&mut self, key: &[u8], members: &[String]) -> Result<(), String> {
+        if members.is_empty() {
+            return Ok(());
+        }
+        let mut cmd = redis::cmd("SADD");
+        cmd.arg(key);
+        for m in members {
+            cmd.arg(m.as_str());
+        }
+        cmd.query(&mut self.conn).map_err(|e| e.to_string())
+    }
+
+    /// SREM key member [member ...]. Removes members from set.
+    #[allow(dead_code)]
+    pub fn srem_members(&mut self, key: &[u8], members: &[String]) -> Result<(), String> {
+        if members.is_empty() {
+            return Ok(());
+        }
+        let mut cmd = redis::cmd("SREM");
+        cmd.arg(key);
+        for m in members {
+            cmd.arg(m.as_str());
+        }
+        cmd.query(&mut self.conn).map_err(|e| e.to_string())
+    }
+
+    /// ZADD key score member [score member ...]. For virtual key table zset updates.
+    pub fn zadd_entries(&mut self, key: &[u8], entries: &[(f64, String)]) -> Result<(), String> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut cmd = redis::cmd("ZADD");
+        cmd.arg(key);
+        for (score, member) in entries {
+            cmd.arg(score).arg(member.as_str());
+        }
+        cmd.query(&mut self.conn).map_err(|e| e.to_string())
+    }
+
     /// Return type of a single key (e.g. "string", "hash"). Key as bytes for binary keys.
     pub fn key_type(&mut self, key: &[u8]) -> Result<String, String> {
         redis::cmd("TYPE")
@@ -309,6 +569,55 @@ impl RedisClient {
         redis::cmd("DBSIZE")
             .query(&mut self.conn)
             .map_err(|e| e.to_string())
+    }
+
+    /// INFO [section]. Returns Redis INFO output as a string. Section defaults to "all".
+    pub fn info(&mut self, section: Option<&str>) -> Result<String, String> {
+        let mut cmd = redis::cmd("INFO");
+        cmd.arg(section.unwrap_or("all"));
+        let raw: Vec<u8> = cmd.query(&mut self.conn).map_err(|e| e.to_string())?;
+        Ok(String::from_utf8_lossy(&raw).into_owned())
+    }
+
+    /// PUBSUB CHANNELS [pattern]. Returns list of channel names. Pattern defaults to *.
+    pub fn pubsub_channels(&mut self, pattern: Option<&str>) -> Result<Vec<String>, String> {
+        let mut cmd = redis::cmd("PUBSUB");
+        cmd.arg("CHANNELS");
+        if let Some(p) = pattern {
+            cmd.arg(p);
+        } else {
+            cmd.arg("*");
+        }
+        cmd.query(&mut self.conn).map_err(|e| e.to_string())
+    }
+
+    /// PUBSUB NUMSUB channel [channel ...]. Returns (`channel_name`, `subscriber_count`) per channel.
+    pub fn pubsub_numsub(&mut self, channels: &[String]) -> Result<Vec<(String, u64)>, String> {
+        if channels.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut cmd = redis::cmd("PUBSUB");
+        cmd.arg("NUMSUB");
+        for c in channels {
+            cmd.arg(c.as_str());
+        }
+        let raw: Vec<RedisValue> = cmd.query(&mut self.conn).map_err(|e| e.to_string())?;
+        let mut out = Vec::with_capacity(channels.len());
+        for chunk in raw.chunks(2) {
+            if chunk.len() >= 2 {
+                let name = match &chunk[0] {
+                    RedisValue::BulkString(b) => String::from_utf8_lossy(b).into_owned(),
+                    RedisValue::Int(n) => n.to_string(),
+                    _ => continue,
+                };
+                let count = match &chunk[1] {
+                    RedisValue::Int(n) => (*n).unsigned_abs(),
+                    _ => 0,
+                };
+                out.push((name, count));
+            }
+        }
+        Ok(out)
     }
 
     /// Discover top-level key prefixes by scanning (keys with "prefix:..." yield "prefix"). Used for key-pattern virtual tables.
@@ -444,7 +753,7 @@ impl RedisClient {
     }
 
     #[allow(dead_code)]
-    pub const fn conn_mut(&mut self) -> &mut Connection {
+    pub const fn conn_mut(&mut self) -> &mut RedisConn {
         &mut self.conn
     }
 }

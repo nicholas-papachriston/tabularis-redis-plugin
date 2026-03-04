@@ -9,7 +9,7 @@ use super::parser::{
 };
 
 /// Max keys to scan when we need an accurate total (filters/order/pattern). Avoids OOM on huge DBs.
-const FULL_SCAN_SAFETY_CAP: u64 = 500_000;
+const FULL_SCAN_SAFETY_CAP: u64 = 10_000_000;
 
 #[allow(clippy::too_many_lines)]
 pub fn execute_redis_keys_scan(
@@ -17,7 +17,7 @@ pub fn execute_redis_keys_scan(
     query: &str,
     page: u64,
     page_size: u64,
-    app_limit: Option<u64>,
+    _app_limit: Option<u64>,
     pattern_override: Option<&str>,
     json_path: Option<&str>,
 ) -> Result<JsonValue, String> {
@@ -25,13 +25,27 @@ pub fn execute_redis_keys_scan(
     let pattern = pattern_override
         .map(String::from)
         .or_else(|| parse_redis_keys_where(&upper, query));
-    let limit_cap = parse_limit(&upper, query).or(app_limit);
+    let query_limit = parse_limit(&upper, query);
     let type_filter = parse_redis_keys_type_filter(&upper, query);
     let value_filter = parse_redis_keys_value_filter(&upper, query);
     let order_by = parse_redis_keys_order_by(&upper, query);
     let order_by_type = order_by.is_some_and(|(col, _)| col == "type");
     let order_by_value = order_by.is_some_and(|(col, _)| col == "value");
     let order_desc = order_by.is_some_and(|(_, d)| d);
+
+    log::info!(
+        "execute_redis_keys_scan: pattern_override={:?} parsed_pattern={:?} type_filter={:?} value_filter={:?} order_by={:?} page={page} page_size={page_size}",
+        pattern_override,
+        pattern.as_deref(),
+        type_filter,
+        value_filter.as_ref().map(|vf| match vf {
+            RedisValueFilterKind::Exact(s) => format!("Exact({s})"),
+            RedisValueFilterKind::StartsWith(s) => format!("StartsWith({s})"),
+            RedisValueFilterKind::Contains(s) => format!("Contains({s})"),
+        }),
+        order_by
+    );
+    log::debug!("execute_redis_keys_scan: query={query}");
 
     let dbsize = client.dbsize()?;
     let skip = usize::try_from((page.saturating_sub(1)) * page_size).unwrap_or(0);
@@ -41,7 +55,8 @@ pub fn execute_redis_keys_scan(
     let max_to_scan: u64 = if need_full_scan {
         FULL_SCAN_SAFETY_CAP
     } else {
-        limit_cap.unwrap_or(u64::MAX)
+        let keys_needed = (skip + take) as u64;
+        query_limit.map_or(keys_needed, |l| l.max(keys_needed))
     };
     let mut all_keys: Vec<Arc<Vec<u8>>> = Vec::new();
     let mut cursor = 0u64;
@@ -170,7 +185,7 @@ pub fn execute_redis_keys_scan(
             let types_for_page: Vec<String> = page_tuples.into_iter().map(|(_, t)| t).collect();
             (page_keys_owned, types_for_page, total_count)
         } else {
-            let total_count = match (limit_cap, pattern.is_some()) {
+            let total_count = match (query_limit, pattern.is_some()) {
                 (Some(_), _) | (None, true) => all_keys.len() as u64,
                 (None, false) => dbsize,
             };
@@ -204,6 +219,7 @@ pub fn execute_redis_keys_scan(
     let mut rows: Vec<JsonValue> = Vec::with_capacity(page_keys.len());
     for (i, key_bytes) in page_keys.iter().enumerate() {
         let key_display = crate::redis_client::bytes_to_display(key_bytes);
+        let key_raw = crate::redis_client::bytes_to_key_id(key_bytes);
         let (type_str, preview) = type_previews
             .get(i)
             .map_or(("", ""), |t| (t.0.as_str(), t.1.as_str()));
@@ -211,7 +227,13 @@ pub fn execute_redis_keys_scan(
             .get(i)
             .and_then(|o| o.as_ref())
             .map_or_else(String::new, std::string::ToString::to_string);
-        rows.push(serde_json::json!([key_display, type_str, preview, ttl_str]));
+        rows.push(serde_json::json!([
+            key_display,
+            type_str,
+            preview,
+            ttl_str,
+            key_raw
+        ]));
     }
     let start = (page.saturating_sub(1)) * page_size;
     let has_more = start + (rows.len() as u64) < total_count;
@@ -222,7 +244,7 @@ pub fn execute_redis_keys_scan(
         rows.len()
     );
     Ok(serde_json::json!({
-        "columns": ["key", "type", "value", "ttl_seconds"],
+        "columns": ["key", "type", "value", "ttl_seconds", "key_raw"],
         "rows": rows,
         "affected_rows": 0u64,
         "truncated": false,
