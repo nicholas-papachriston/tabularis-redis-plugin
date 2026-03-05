@@ -4,6 +4,7 @@ use crate::methods::common::{
 };
 use crate::redis_client::RedisClient;
 use serde_json::Value as JsonValue;
+use std::collections::HashSet;
 
 /// Virtual table that lists all Redis keys (via SCAN). Shows real keys in the DB, not just tabularis metadata.
 pub const REDIS_KEYS_TABLE: &str = "__redis_keys__";
@@ -133,12 +134,14 @@ pub fn list_table_names(
     _schema: Option<&str>,
 ) -> Result<Vec<String>, String> {
     let mut names = client.metadata().list_tables()?;
-    if !names.contains(&REDIS_KEYS_TABLE.to_string()) {
+    let mut seen: HashSet<String> = names.iter().cloned().collect();
+    if seen.insert(REDIS_KEYS_TABLE.to_string()) {
         names.push(REDIS_KEYS_TABLE.to_string());
     }
     for (table_name, _) in TYPE_VIRTUAL_TABLES {
-        if !names.contains(&(*table_name).to_string()) {
-            names.push((*table_name).to_string());
+        let s = (*table_name).to_string();
+        if seen.insert(s.clone()) {
+            names.push(s);
         }
     }
     let prefixes = client.scan_key_prefixes(500)?;
@@ -149,7 +152,7 @@ pub fn list_table_names(
             continue;
         }
         let virtual_name = format!("{KEY_PATTERN_SAFE_PREFIX}{prefix}{KEY_PATTERN_SUFFIX}");
-        if !names.contains(&virtual_name) {
+        if seen.insert(virtual_name.clone()) {
             names.push(virtual_name);
         }
     }

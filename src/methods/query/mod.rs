@@ -18,46 +18,16 @@ use redis_keys::execute_redis_keys_scan;
 use sql_parser::{evaluate_where, parse_sql, ParsedStatement};
 use type_tables::execute_type_table_scan;
 
-/// Fetch one row as column values; returns None if the row is missing or not an object/hash.
-fn fetch_row_values(
-    client: &mut RedisClient,
-    table: &str,
-    pk: &str,
-    columns: &[String],
-    mode: RowStorageMode,
-) -> Result<Option<Vec<JsonValue>>, AppError> {
-    match mode {
-        RowStorageMode::Json => {
-            let opt = client
-                .metadata()
-                .get_row_json(table, pk)
-                .map_err(AppError::Backend)?;
-            let Some(obj) = opt.and_then(|v| v.as_object().cloned()) else {
-                return Ok(None);
-            };
-            Ok(Some(row_values_for_columns(columns, pk, None, Some(&obj))))
-        }
-        RowStorageMode::Hash => {
-            let opt = client
-                .metadata()
-                .get_row_hash(table, pk)
-                .map_err(AppError::Backend)?;
-            let Some(map) = opt.as_ref() else {
-                return Ok(None);
-            };
-            Ok(Some(row_values_for_columns(columns, pk, Some(map), None)))
-        }
-    }
-}
+const BATCH_CHUNK: usize = 200;
 
-/// Fetch multiple rows in one pipelined batch. Returns row values in same order as pks; skips missing/empty.
+/// Fetch multiple rows in one pipelined batch. Returns one Option per pk: Some(row) when present and non-empty, None when missing/empty.
 fn fetch_rows_batch(
     client: &mut RedisClient,
     table: &str,
     columns: &[String],
     mode: RowStorageMode,
     pks: &[String],
-) -> Result<Vec<Vec<JsonValue>>, AppError> {
+) -> Result<Vec<Option<Vec<JsonValue>>>, AppError> {
     if pks.is_empty() {
         return Ok(Vec::new());
     }
@@ -70,9 +40,10 @@ fn fetch_rows_batch(
                 .map_err(AppError::Backend)?;
             for (pk, map) in pks.iter().zip(maps) {
                 if map.is_empty() {
-                    continue;
+                    out.push(None);
+                } else {
+                    out.push(Some(row_values_for_columns(columns, pk, Some(&map), None)));
                 }
-                out.push(row_values_for_columns(columns, pk, Some(&map), None));
             }
         }
         RowStorageMode::Json => {
@@ -81,10 +52,11 @@ fn fetch_rows_batch(
                 .get_rows_json_batch(table, pks)
                 .map_err(AppError::Backend)?;
             for (pk, opt) in pks.iter().zip(opts) {
-                let Some(JsonValue::Object(obj)) = opt.as_ref() else {
-                    continue;
-                };
-                out.push(row_values_for_columns(columns, pk, None, Some(obj)));
+                let row = opt
+                    .as_ref()
+                    .and_then(|v| v.as_object())
+                    .map(|obj| row_values_for_columns(columns, pk, None, Some(obj)));
+                out.push(row);
             }
         }
     }
@@ -211,16 +183,21 @@ fn execute_select_parsed(
     let (total_count, page_rows) = if need_full_scan {
         let all_keys = client.metadata().list_row_keys(table)?;
         let mut rows_with_pk: Vec<(String, Vec<JsonValue>)> = Vec::new();
-        for pk in &all_keys {
-            let Some(row_values) = fetch_row_values(client, table, pk, &column_names, mode)? else {
-                continue;
-            };
-            let matches = sel.where_clause.as_ref().is_none_or(|expr| {
-                let row_strs: Vec<String> = row_values.iter().map(json_value_to_cmp_str).collect();
-                evaluate_where(&column_names, &row_strs, expr)
-            });
-            if matches {
-                rows_with_pk.push((pk.clone(), row_values));
+        for chunk in all_keys.chunks(BATCH_CHUNK) {
+            let pks: Vec<String> = chunk.to_vec();
+            let batch_rows = fetch_rows_batch(client, table, &column_names, mode, &pks)?;
+            for (pk, opt_row) in pks.into_iter().zip(batch_rows) {
+                let Some(row_values) = opt_row else {
+                    continue;
+                };
+                let matches = sel.where_clause.as_ref().is_none_or(|expr| {
+                    let row_strs: Vec<String> =
+                        row_values.iter().map(json_value_to_cmp_str).collect();
+                    evaluate_where(&column_names, &row_strs, expr)
+                });
+                if matches {
+                    rows_with_pk.push((pk, row_values));
+                }
             }
         }
         if let Some((ref col, asc)) = sel.order_by.first() {
@@ -254,29 +231,38 @@ fn execute_select_parsed(
         } else {
             skip as u64 + (page_keys.len() as u64)
         };
-        let out = fetch_rows_batch(client, table, &column_names, mode, &page_keys)?;
+        let batch = fetch_rows_batch(client, table, &column_names, mode, &page_keys)?;
+        let out: Vec<Vec<JsonValue>> = batch.into_iter().flatten().collect();
         (total, out)
     } else {
         let all_keys = client.metadata().list_row_keys(table)?;
-        let mut filtered: Vec<String> = all_keys;
-        if let Some(ref expr) = sel.where_clause {
-            filtered.retain(|pk| {
-                let Some(row_values) = fetch_row_values(client, table, pk, &column_names, mode)
-                    .ok()
-                    .flatten()
-                else {
-                    return false;
+        let mut filtered: Vec<String> = if let Some(ref expr) = sel.where_clause {
+            let mut out = Vec::new();
+            for chunk in all_keys.chunks(BATCH_CHUNK) {
+                let pks: Vec<String> = chunk.to_vec();
+                let batch_rows = fetch_rows_batch(client, table, &column_names, mode, &pks)?;
+            for (pk, opt_row) in pks.into_iter().zip(batch_rows) {
+                let Some(row_values) = opt_row else {
+                    continue;
                 };
-                let row_strs: Vec<String> = row_values.iter().map(json_value_to_cmp_str).collect();
-                evaluate_where(&column_names, &row_strs, expr)
-            });
-        }
+                let row_strs: Vec<String> =
+                    row_values.iter().map(json_value_to_cmp_str).collect();
+                if evaluate_where(&column_names, &row_strs, expr) {
+                    out.push(pk);
+                }
+            }
+            }
+            out
+        } else {
+            all_keys
+        };
         if let Some(limit) = sql_limit {
             filtered.truncate(limit);
         }
         let total = filtered.len();
         let page_keys: Vec<String> = filtered.into_iter().skip(skip).take(take_n).collect();
-        let out = fetch_rows_batch(client, table, &column_names, mode, &page_keys)?;
+        let batch = fetch_rows_batch(client, table, &column_names, mode, &page_keys)?;
+        let out: Vec<Vec<JsonValue>> = batch.into_iter().flatten().collect();
         (total as u64, out)
     };
 
@@ -305,7 +291,6 @@ fn execute_select_parsed(
     Ok(result)
 }
 
-#[allow(dead_code)]
 fn execute_select_aggregated(
     client: &mut RedisClient,
     sel: &sql_parser::SelectQuery,
@@ -324,16 +309,21 @@ fn execute_select_aggregated(
     let mode = client.metadata().get_table_mode(table)?;
     let all_keys = client.metadata().list_row_keys(table)?;
     let mut rows: Vec<Vec<JsonValue>> = Vec::new();
-    for pk in &all_keys {
-        let Some(row_values) = fetch_row_values(client, table, pk, &column_names, mode)? else {
-            continue;
-        };
-        let matches = sel.where_clause.as_ref().is_none_or(|expr| {
-            let row_strs: Vec<String> = row_values.iter().map(json_value_to_cmp_str).collect();
-            evaluate_where(&column_names, &row_strs, expr)
-        });
-        if matches {
-            rows.push(row_values);
+    for chunk in all_keys.chunks(BATCH_CHUNK) {
+        let pks: Vec<String> = chunk.to_vec();
+        let batch_rows = fetch_rows_batch(client, table, &column_names, mode, &pks)?;
+        for (_, opt_row) in pks.into_iter().zip(batch_rows) {
+            let Some(row_values) = opt_row else {
+                continue;
+            };
+            let matches = sel.where_clause.as_ref().is_none_or(|expr| {
+                let row_strs: Vec<String> =
+                    row_values.iter().map(json_value_to_cmp_str).collect();
+                evaluate_where(&column_names, &row_strs, expr)
+            });
+            if matches {
+                rows.push(row_values);
+            }
         }
     }
     let (output_columns, agg_rows) =
@@ -419,30 +409,34 @@ fn execute_update_parsed(
     );
     let all_keys = client.metadata().list_row_keys(table)?;
     let mut affected = 0u64;
-    for pk in &all_keys {
-        let Some(row_values) = fetch_row_values(client, table, pk, &column_names, mode)? else {
-            continue;
-        };
-        let row_strs: Vec<String> = row_values.iter().map(json_value_to_cmp_str).collect();
-        let matches = upd
-            .where_clause
-            .as_ref()
-            .is_none_or(|expr| sql_parser::evaluate_where(&column_names, &row_strs, expr));
-        if !matches {
-            continue;
-        }
-        let pk_value = JsonValue::String(pk.clone());
-        for (col, val) in &upd.assignments {
-            let n = crud::update_record(
-                client,
-                None,
-                table,
-                &pk_col,
-                &pk_value,
-                col,
-                &JsonValue::String(val.clone()),
-            )?;
-            affected += n;
+    for chunk in all_keys.chunks(BATCH_CHUNK) {
+        let pks: Vec<String> = chunk.to_vec();
+        let batch_rows = fetch_rows_batch(client, table, &column_names, mode, &pks)?;
+        for (pk, opt_row) in pks.into_iter().zip(batch_rows) {
+            let Some(row_values) = opt_row else {
+                continue;
+            };
+            let row_strs: Vec<String> = row_values.iter().map(json_value_to_cmp_str).collect();
+            let matches = upd
+                .where_clause
+                .as_ref()
+                .is_none_or(|expr| sql_parser::evaluate_where(&column_names, &row_strs, expr));
+            if !matches {
+                continue;
+            }
+            let pk_value = JsonValue::String(pk.clone());
+            for (col, val) in &upd.assignments {
+                let n = crud::update_record(
+                    client,
+                    None,
+                    table,
+                    &pk_col,
+                    &pk_value,
+                    col,
+                    &JsonValue::String(val.clone()),
+                )?;
+                affected += n;
+            }
         }
     }
     let mut result = serde_json::json!({
@@ -479,20 +473,29 @@ fn execute_delete_parsed(
         .unwrap_or_default();
     let all_keys = client.metadata().list_row_keys(table)?;
     let mut affected = 0u64;
-    for pk in &all_keys {
-        let Some(row_values) = fetch_row_values(client, table, pk, &column_names, mode)? else {
-            continue;
-        };
-        let row_strs: Vec<String> = row_values.iter().map(json_value_to_cmp_str).collect();
-        let matches = del
-            .where_clause
-            .as_ref()
-            .is_none_or(|expr| sql_parser::evaluate_where(&column_names, &row_strs, expr));
-        if matches {
-            let n =
-                crud::delete_record(client, None, table, &pk_col, &JsonValue::String(pk.clone()))
-                    .map_err(AppError::Backend)?;
-            affected += n;
+    for chunk in all_keys.chunks(BATCH_CHUNK) {
+        let pks: Vec<String> = chunk.to_vec();
+        let batch_rows = fetch_rows_batch(client, table, &column_names, mode, &pks)?;
+        for (pk, opt_row) in pks.into_iter().zip(batch_rows) {
+            let Some(row_values) = opt_row else {
+                continue;
+            };
+            let row_strs: Vec<String> = row_values.iter().map(json_value_to_cmp_str).collect();
+            let matches = del
+                .where_clause
+                .as_ref()
+                .is_none_or(|expr| sql_parser::evaluate_where(&column_names, &row_strs, expr));
+            if matches {
+                let n = crud::delete_record(
+                    client,
+                    None,
+                    table,
+                    &pk_col,
+                    &JsonValue::String(pk),
+                )
+                .map_err(AppError::Backend)?;
+                affected += n;
+            }
         }
     }
     let mut result = serde_json::json!({

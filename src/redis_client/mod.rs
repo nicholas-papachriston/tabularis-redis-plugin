@@ -79,6 +79,17 @@ pub fn bytes_to_key_id(b: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(b)
 }
 
+/// Parse Redis ZRANGE WITHSCORES reply score; logs warning and returns 0.0 on invalid data.
+fn parse_zscore(s: &str) -> f64 {
+    match s.parse::<f64>() {
+        Ok(n) => n,
+        Err(e) => {
+            log::warn!("Invalid zset score '{s}': {e}, using 0.0");
+            0.0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,10 +190,11 @@ impl MetadataStoreWithCache<'_> {
             return Ok(Some(cols));
         }
         let result = self.store().get_table_columns(table)?;
-        if let Some(ref cols) = result {
-            self.cache.set_columns(table, cols.clone());
+        if let Some(cols) = result {
+            self.cache.set_columns(table, cols);
+            return Ok(self.cache.get_columns(table));
         }
-        Ok(result)
+        Ok(None)
     }
 
     pub fn get_table_pk(&mut self, table: &str) -> Result<Option<String>, String> {
@@ -190,10 +202,11 @@ impl MetadataStoreWithCache<'_> {
             return Ok(Some(pk));
         }
         let result = self.store().get_table_pk(table)?;
-        if let Some(ref pk) = result {
-            self.cache.set_pk(table, pk.clone());
+        if let Some(pk) = result {
+            self.cache.set_pk(table, &pk);
+            return Ok(self.cache.get_pk(table));
         }
-        Ok(result)
+        Ok(None)
     }
 
     pub fn get_table_mode(&mut self, table: &str) -> Result<RowStorageMode, String> {
@@ -793,10 +806,8 @@ impl RedisClient {
                 }
             };
             let score = match &raw[i + 1] {
-                RedisValue::BulkString(b) => {
-                    String::from_utf8_lossy(b).parse::<f64>().unwrap_or(0.0)
-                }
-                RedisValue::SimpleString(s) => s.parse::<f64>().unwrap_or(0.0),
+                RedisValue::BulkString(b) => parse_zscore(&String::from_utf8_lossy(b)),
+                RedisValue::SimpleString(s) => parse_zscore(s),
                 RedisValue::Int(n) => {
                     #[allow(clippy::cast_precision_loss)]
                     let s = *n as f64;
@@ -973,10 +984,8 @@ impl RedisClient {
                         }
                     };
                     let score = match &raw[i + 1] {
-                        RedisValue::BulkString(b) => {
-                            String::from_utf8_lossy(b).parse::<f64>().unwrap_or(0.0)
-                        }
-                        RedisValue::SimpleString(s) => s.parse::<f64>().unwrap_or(0.0),
+                        RedisValue::BulkString(b) => parse_zscore(&String::from_utf8_lossy(b)),
+                        RedisValue::SimpleString(s) => parse_zscore(s),
                         RedisValue::Int(n) => {
                             #[allow(clippy::cast_precision_loss)]
                             let s = *n as f64;
@@ -1124,6 +1133,46 @@ impl RedisClient {
             -1 => Some(-1),
             n => Some(n),
         })
+    }
+
+    /// Pipeline HLEN/LLEN/SCARD/ZCARD/XLEN for keys of the given type. Returns one length per key.
+    /// Used for type-table page-first retrieval to know row counts without fetching full data.
+    pub fn key_cardinality_batch(
+        &mut self,
+        keys: &[&[u8]],
+        redis_type: &str,
+    ) -> Result<Vec<u64>, String> {
+        const CHUNK: usize = 500;
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+        let cmd = match redis_type {
+            "hash" => "HLEN",
+            "list" => "LLEN",
+            "set" => "SCARD",
+            "zset" => "ZCARD",
+            "stream" => "XLEN",
+            _ => return Err(format!("unsupported type for cardinality: {redis_type}")),
+        };
+        let mut out = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(CHUNK) {
+            let mut pipe = redis::pipe();
+            for k in chunk {
+                pipe.cmd(cmd).arg(*k);
+            }
+            let raw: Vec<i64> = pipe.query(&mut self.conn).map_err(|e| e.to_string())?;
+            for n in raw {
+                out.push(if n < 0 {
+                    0
+                } else {
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        n as u64
+                    }
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// Pipeline TYPE for many keys. Returns one type string per key (e.g. "string", "hash").

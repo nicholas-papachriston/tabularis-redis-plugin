@@ -198,6 +198,7 @@ fn execute_single_key(
     ))
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_full_scan(
     client: &mut RedisClient,
     table: &str,
@@ -227,15 +228,86 @@ fn execute_full_scan(
     let types = client
         .key_types_batch(&key_refs)
         .map_err(AppError::Backend)?;
-    let matching: Vec<&[u8]> = all_keys
-        .iter()
-        .zip(types.iter())
+    let matching: Vec<Vec<u8>> = all_keys
+        .into_iter()
+        .zip(types)
         .filter(|(_, t)| t.as_str() == redis_type)
-        .map(|(k, _)| k.as_slice())
+        .map(|(k, _)| k)
         .collect();
 
-    let rows = fetch_all_rows_for_type(client, table, redis_type, &matching)?;
-    let (page_rows, total, has_more) = paginate(&rows, page, page_size);
+    if matching.is_empty() {
+        let columns: &[&str] = match table {
+            "hashes" => &["key", "field", "value"],
+            "lists" => &["key", "index", "value"],
+            "zsets" => &["key", "value", "score"],
+            "streams" => &["key", "id", "fields"],
+            _ => &["key", "value"],
+        };
+        return Ok(build_result(
+            columns,
+            &[],
+            page,
+            page_size,
+            0,
+            false,
+        ));
+    }
+
+    let lengths = client
+        .key_cardinality_batch(
+            &matching.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            redis_type,
+        )
+        .map_err(AppError::Backend)?;
+    let mut cumulative = Vec::with_capacity(matching.len() + 1);
+    cumulative.push(0u64);
+    for len in &lengths {
+        cumulative.push(cumulative.last().copied().unwrap_or(0) + *len);
+    }
+    let total = cumulative.last().copied().unwrap_or(0);
+    let page_size = page_size.max(1);
+    let skip = (page.saturating_sub(1)) * page_size;
+    let take = page_size;
+
+    let (start_key, offset_in_first) = if skip >= total {
+        (matching.len(), 0u64)
+    } else {
+        let idx = cumulative
+            .iter()
+            .position(|&c| c > skip)
+            .map_or(0, |i| i.saturating_sub(1));
+        let offset = skip - cumulative.get(idx).copied().unwrap_or(0);
+        (idx, offset)
+    };
+    let end_key = if skip + take == 0 {
+        start_key
+    } else {
+        let end_row = skip + take;
+        cumulative
+            .iter()
+            .position(|&c| c >= end_row)
+            .map_or_else(|| matching.len().saturating_sub(1), |i| i.saturating_sub(1))
+    };
+
+    let keys_to_fetch: Vec<&[u8]> = if start_key <= end_key && end_key < matching.len() {
+        matching[start_key..=end_key].iter().map(Vec::as_slice).collect()
+    } else {
+        Vec::new()
+    };
+
+    let rows = if keys_to_fetch.is_empty() {
+        Vec::new()
+    } else {
+        let full = fetch_all_rows_for_type(client, table, redis_type, &keys_to_fetch)?;
+        let offset_usize = usize::try_from(offset_in_first).unwrap_or(usize::MAX).min(full.len());
+        let take_usize = usize::try_from(take).unwrap_or(usize::MAX).min(full.len().saturating_sub(offset_usize));
+        full.into_iter()
+            .skip(offset_usize)
+            .take(take_usize)
+            .collect::<Vec<_>>()
+    };
+
+    let has_more = skip + (rows.len() as u64) < total;
     let columns: &[&str] = match table {
         "hashes" => &["key", "field", "value"],
         "lists" => &["key", "index", "value"],
@@ -244,7 +316,12 @@ fn execute_full_scan(
         _ => &["key", "value"],
     };
     Ok(build_result(
-        columns, &page_rows, page, page_size, total, has_more,
+        columns,
+        &rows,
+        page,
+        page_size,
+        total,
+        has_more,
     ))
 }
 

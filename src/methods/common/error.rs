@@ -1,7 +1,6 @@
 use serde_json::Value as JsonValue;
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum AppError {
     InvalidParams(String),
     MethodNotFound(String),
@@ -9,6 +8,7 @@ pub enum AppError {
     Unsupported(String),
     Conflict(String),
     Backend(String),
+    #[allow(dead_code)]
     Internal(String),
 }
 

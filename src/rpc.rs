@@ -6,6 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, Write};
 
 fn connection_key(params: &crate::models::ConnectionParams) -> String {
+    let driver = params.driver.as_str();
     let host = params.host.as_deref().unwrap_or("127.0.0.1");
     let port = params.port.unwrap_or(6379);
     let db = params
@@ -25,9 +26,9 @@ fn connection_key(params: &crate::models::ConnectionParams) -> String {
         .cluster_nodes
         .as_ref()
         .map(|v| {
-            let mut v = v.clone();
-            v.sort();
-            v.join(",")
+            let mut refs: Vec<&str> = v.iter().map(String::as_str).collect();
+            refs.sort_unstable();
+            refs.join(",")
         })
         .unwrap_or_default();
     let sentinel_master = params.sentinel_master.as_deref().unwrap_or("");
@@ -35,12 +36,12 @@ fn connection_key(params: &crate::models::ConnectionParams) -> String {
         .sentinel_nodes
         .as_ref()
         .map(|v| {
-            let mut v = v.clone();
-            v.sort();
-            v.join(",")
+            let mut refs: Vec<&str> = v.iter().map(String::as_str).collect();
+            refs.sort_unstable();
+            refs.join(",")
         })
         .unwrap_or_default();
-    format!("{host}:{port}/{db}|u={username}|pw={pw_tag}|tls={tls}|ct={ct}|rt={rt}|wt={wt}|cluster={cluster}|sm={sentinel_master}|sn={sentinel_nodes}")
+    format!("{driver}|{host}:{port}/{db}|u={username}|pw={pw_tag}|tls={tls}|ct={ct}|rt={rt}|wt={wt}|cluster={cluster}|sm={sentinel_master}|sn={sentinel_nodes}")
 }
 
 /// Get a cached connection (if open) or create a new one. Evicts stale entries without PING round-trip.
@@ -49,17 +50,16 @@ fn get_or_create_connection<'a>(
     key: &str,
     conn_params: &crate::models::ConnectionParams,
 ) -> Result<&'a mut RedisClient, String> {
-    if connections
-        .get(key)
-        .is_some_and(super::redis_client::RedisClient::is_open)
-    {
-        return Ok(connections.get_mut(key).expect("just checked"));
+    let need_new = connections.get(key).is_none_or(|c| !c.is_open());
+    if need_new {
+        connections.remove(key);
+        let client = RedisClient::connect(conn_params)?;
+        log::info!("Created new Redis connection for key {key}");
+        connections.insert(key.to_string(), client);
     }
-    connections.remove(key);
-    let client = RedisClient::connect(conn_params)?;
-    log::info!("Created new Redis connection for key {key}");
-    connections.insert(key.to_string(), client);
-    Ok(connections.get_mut(key).expect("just inserted"))
+    connections
+        .get_mut(key)
+        .ok_or_else(|| "connection state inconsistent".to_string())
 }
 
 /// Handle a single JSON-RPC request: resolve connection, dispatch method, return response.
@@ -166,8 +166,11 @@ fn send_error(stdout: &mut io::Stdout, id: &JsonValue, code: i32, message: &str)
     match serde_json::to_string(&response) {
         Ok(s) => {
             let out = s + "\n";
-            let _ = stdout.write_all(out.as_bytes());
-            let _ = stdout.flush();
+            if let Err(e) = stdout.write_all(out.as_bytes()) {
+                log::error!("Failed to write error response: {e}");
+            } else if let Err(e) = stdout.flush() {
+                log::error!("Failed to flush stdout after error response: {e}");
+            }
         }
         Err(e) => log::error!("Failed to serialize error response: {e}"),
     }

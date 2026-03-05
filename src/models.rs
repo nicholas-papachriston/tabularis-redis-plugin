@@ -4,7 +4,6 @@ use serde_json::Value as JsonValue;
 /// Connection params from Tabularis (params.params in JSON-RPC).
 #[derive(Debug, Clone, Default)]
 pub struct ConnectionParams {
-    #[allow(dead_code)]
     pub driver: String,
     pub host: Option<String>,
     pub port: Option<u16>,

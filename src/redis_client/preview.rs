@@ -268,6 +268,7 @@ pub fn key_type_and_preview_batch(
     Ok(out)
 }
 
+#[allow(dead_code)]
 pub fn key_type_and_preview(
     conn: &mut impl ConnectionLike,
     key: &[u8],

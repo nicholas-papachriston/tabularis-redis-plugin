@@ -162,6 +162,10 @@ pub fn execute_redis_keys_scan(
                     .collect();
                 let types2: Vec<String> = keys_with_types.iter().map(|(_, t)| t.clone()).collect();
                 let previews = client.key_value_preview_batch(&key_refs2, &types2, json_path)?;
+                let contains_needle_lower: Option<String> = match vf {
+                    RedisValueFilterKind::Contains(s) => Some(s.as_ref().to_lowercase()),
+                    _ => None,
+                };
                 let mut filtered: Vec<(Arc<Vec<u8>>, String)> =
                     Vec::with_capacity(keys_with_types.len());
                 let mut filtered_previews: Vec<String> = Vec::with_capacity(keys_with_types.len());
@@ -172,9 +176,9 @@ pub fn execute_redis_keys_scan(
                             let s = s.as_ref();
                             preview.len() >= s.len() && preview[..s.len()].eq_ignore_ascii_case(s)
                         }
-                        RedisValueFilterKind::Contains(s) => {
-                            preview.to_lowercase().contains(&s.as_ref().to_lowercase())
-                        }
+                        RedisValueFilterKind::Contains(_) => contains_needle_lower
+                            .as_ref()
+                            .is_some_and(|needle| preview.to_lowercase().contains(needle))
                     };
                     if matches {
                         filtered.push((k, t));

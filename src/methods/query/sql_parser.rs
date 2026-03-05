@@ -132,47 +132,81 @@ pub struct DropTableQuery {
 
 /// SQL LIKE pattern matching: % = any sequence, _ = any single character.
 pub fn sql_like_match(haystack: &str, pattern: &str) -> bool {
-    like_match_str(haystack, pattern)
+    like_match_iterative(haystack, pattern)
 }
 
-fn like_match_str(hay: &str, pat: &str) -> bool {
-    let mut p = pat.chars();
-    match p.next() {
-        None => hay.is_empty(),
-        Some('%') => {
-            let rest: String = p.collect();
-            if rest.is_empty() {
-                return true;
-            }
-            for (idx, _) in hay.char_indices() {
-                if like_match_str(&hay[idx..], &rest) {
-                    return true;
-                }
-            }
-            like_match_str("", &rest)
-        }
-        Some('_') => {
-            if let Some((pos, _)) = hay.char_indices().next() {
-                let char_len = hay[pos..].chars().next().map_or(0, char::len_utf8);
-                like_match_str(&hay[pos + char_len..], p.as_str())
-            } else {
-                false
-            }
-        }
-        Some(pc) => {
-            if let Some((pos, hc)) = hay.char_indices().next() {
-                if hc == pc {
-                    let char_len = pc.len_utf8();
-                    like_match_str(&hay[pos + char_len..], p.as_str())
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
+/// Returns true if segment matches hay at position start; segment may contain '_' (any one char).
+fn segment_matches(hay_chars: &[char], start: usize, segment: &[char]) -> bool {
+    if start + segment.len() > hay_chars.len() {
+        return false;
+    }
+    for (i, &sc) in segment.iter().enumerate() {
+        let hc = hay_chars[start + i];
+        if sc != '_' && sc != hc {
+            return false;
         }
     }
+    true
 }
+
+/// Single-pass iterative LIKE: split pattern by %, match each segment in order; _ = one char.
+fn like_match_iterative(hay: &str, pat: &str) -> bool {
+    let pat_chars: Vec<char> = pat.chars().collect();
+    if pat_chars.is_empty() {
+        return hay.is_empty();
+    }
+    let mut segs: Vec<Vec<char>> = Vec::new();
+    let mut cur = Vec::new();
+    for &c in &pat_chars {
+        if c == '%' {
+            if !cur.is_empty() {
+                segs.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() {
+        segs.push(cur);
+    }
+    let leading_wild = pat.starts_with('%');
+    let trailing_wild = pat.ends_with('%');
+    let hay_chars: Vec<char> = hay.chars().collect();
+    let n = hay_chars.len();
+    let mut hay_start = 0;
+    for (seg_idx, seg) in segs.iter().enumerate() {
+        if seg.is_empty() {
+            continue;
+        }
+        let is_first = seg_idx == 0 && !leading_wild;
+        let is_last = seg_idx == segs.len() - 1 && !trailing_wild;
+        let need = seg.len();
+        if need > n.saturating_sub(hay_start) {
+            return false;
+        }
+        let found = if is_first {
+            if segment_matches(&hay_chars, hay_start, seg) {
+                Some(hay_start + need)
+            } else {
+                None
+            }
+        } else if is_last {
+            (hay_start..=n.saturating_sub(need))
+                .find(|&i| segment_matches(&hay_chars, i, seg))
+                .map(|i| i + need)
+        } else {
+            (hay_start..=n.saturating_sub(need))
+                .find(|&i| segment_matches(&hay_chars, i, seg))
+                .map(|i| i + need)
+        };
+        let Some(next_start) = found else {
+            return false;
+        };
+        hay_start = next_start;
+    }
+    trailing_wild || hay_start >= n
+}
+
 
 /// Evaluate WHERE expression against a row. `column_names` and `row_values` must be parallel (same length).
 pub fn evaluate_where(column_names: &[String], row_values: &[String], expr: &WhereExpr) -> bool {
@@ -189,23 +223,52 @@ pub fn evaluate_where(column_names: &[String], row_values: &[String], expr: &Whe
     }
 }
 
+fn try_cmp_numeric(cell: &str, lit: &str, op: std::cmp::Ordering) -> Option<bool> {
+    let a: f64 = cell.trim().parse().ok()?;
+    let b: f64 = lit.trim().parse().ok()?;
+    Some(a.partial_cmp(&b).is_some_and(|ord| ord == op))
+}
+
+fn try_cmp_numeric_ge(cell: &str, lit: &str) -> Option<bool> {
+    let a: f64 = cell.trim().parse().ok()?;
+    let b: f64 = lit.trim().parse().ok()?;
+    Some(a.partial_cmp(&b).is_some_and(|ord| ord != std::cmp::Ordering::Less))
+}
+
+fn try_cmp_numeric_le(cell: &str, lit: &str) -> Option<bool> {
+    let a: f64 = cell.trim().parse().ok()?;
+    let b: f64 = lit.trim().parse().ok()?;
+    Some(a.partial_cmp(&b).is_some_and(|ord| ord != std::cmp::Ordering::Greater))
+}
+
 fn evaluate_condition(column_names: &[String], row_values: &[String], c: &Condition) -> bool {
     let Some(col_idx) = column_names.iter().position(|n| n == &c.column) else {
         return false;
     };
     let cell = row_values.get(col_idx).map_or("", String::as_str);
+    let lit = c.value.as_literal();
     let result = match &c.op {
-        ComparisonOp::Eq => cell == c.value.as_literal(),
-        ComparisonOp::Ne => cell != c.value.as_literal(),
-        ComparisonOp::Gt => cell > c.value.as_literal(),
-        ComparisonOp::Lt => cell < c.value.as_literal(),
-        ComparisonOp::Gte => cell >= c.value.as_literal(),
-        ComparisonOp::Lte => cell <= c.value.as_literal(),
-        ComparisonOp::Like => sql_like_match(cell, c.value.as_literal()),
+        ComparisonOp::Eq => cell == lit,
+        ComparisonOp::Ne => cell != lit,
+        ComparisonOp::Gt => try_cmp_numeric(cell, lit, std::cmp::Ordering::Greater)
+            .unwrap_or_else(|| cell > lit),
+        ComparisonOp::Lt => try_cmp_numeric(cell, lit, std::cmp::Ordering::Less)
+            .unwrap_or_else(|| cell < lit),
+        ComparisonOp::Gte => try_cmp_numeric_ge(cell, lit).unwrap_or_else(|| cell >= lit),
+        ComparisonOp::Lte => try_cmp_numeric_le(cell, lit).unwrap_or_else(|| cell <= lit),
+        ComparisonOp::Like => sql_like_match(cell, lit),
         ComparisonOp::In => c.value.as_list().iter().any(|v| v == cell),
         ComparisonOp::Between => {
             let (lo, hi) = c.value.as_range();
-            cell >= lo && cell <= hi
+            if let (Some(a), Some(b), Some(c_hi)) = (
+                cell.trim().parse::<f64>().ok(),
+                lo.trim().parse::<f64>().ok(),
+                hi.trim().parse::<f64>().ok(),
+            ) {
+                a >= b && a <= c_hi
+            } else {
+                cell >= lo && cell <= hi
+            }
         }
     };
     result

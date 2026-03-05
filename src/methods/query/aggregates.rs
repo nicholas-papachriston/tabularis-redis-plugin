@@ -66,7 +66,9 @@ pub fn compute_aggregates(
     let mut group_keys: Vec<_> = groups.keys().collect();
     group_keys.sort();
     for key in group_keys {
-        let group_rows = groups.get(key).unwrap();
+        let Some(group_rows) = groups.get(key) else {
+            continue;
+        };
         let mut row: Vec<JsonValue> = key.iter().map(|s| JsonValue::String(s.clone())).collect();
         for (col_idx, agg) in &agg_col_indices {
             let val = compute_one_aggregate(agg.function, *col_idx, &agg.column, group_rows);

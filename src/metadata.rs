@@ -483,6 +483,7 @@ impl<'a, C: ConnectionLike> MetadataStore<'a, C> {
     }
 
     /// Remove a table from the registry and delete all its data and metadata. Fails if the table is not in the registry.
+    /// Uses cursor-based SSCAN and chunked pipelines so all rows are removed regardless of table size (no memory cap).
     pub fn drop_table(&mut self, table: &str) -> Result<(), String> {
         const CHUNK: usize = 500;
         let tables_key = Self::meta_tables_key();
@@ -497,16 +498,25 @@ impl<'a, C: ConnectionLike> MetadataStore<'a, C> {
             ));
         }
 
-        let pks = self.list_row_keys(table)?;
         let keys_set = Self::data_keys_set(table);
-        for chunk in pks.chunks(CHUNK) {
-            let mut pipe = redis::pipe();
-            for pk in chunk {
-                let key = Self::data_key(table, pk);
-                pipe.cmd("DEL").arg(&key).ignore();
-                pipe.cmd("SREM").arg(&keys_set).arg(pk).ignore();
+        let mut cursor = 0u64;
+        let mut total_removed = 0usize;
+        loop {
+            let (next, batch) = self.scan_row_keys(table, cursor, CHUNK)?;
+            if !batch.is_empty() {
+                let mut pipe = redis::pipe();
+                for pk in &batch {
+                    let key = Self::data_key(table, pk);
+                    pipe.cmd("DEL").arg(&key).ignore();
+                    pipe.cmd("SREM").arg(&keys_set).arg(pk).ignore();
+                }
+                pipe.query::<()>(self.conn).map_err(|e| e.to_string())?;
+                total_removed += batch.len();
             }
-            pipe.query::<()>(self.conn).map_err(|e| e.to_string())?;
+            if next == 0 {
+                break;
+            }
+            cursor = next;
         }
 
         redis::cmd("DEL")
@@ -532,10 +542,7 @@ impl<'a, C: ConnectionLike> MetadataStore<'a, C> {
             .query::<()>(self.conn)
             .map_err(|e| e.to_string())?;
 
-        log::info!(
-            "drop_table: dropped table {table} ({} rows removed)",
-            pks.len()
-        );
+        log::info!("drop_table: dropped table {table} ({total_removed} rows removed)");
         Ok(())
     }
 }

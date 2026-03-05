@@ -3,14 +3,16 @@
 
 use crate::models::ColumnDef;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const DEFAULT_TTL_SECS: u64 = 60;
 
 /// Caches table columns and PK in memory. Entries expire after `ttl`.
+/// Columns are stored as Arc to avoid cloning when populating from store; one clone on read.
 pub struct SchemaCache {
-    columns: HashMap<String, (Vec<ColumnDef>, Instant)>,
-    pk: HashMap<String, (String, Instant)>,
+    columns: HashMap<String, (Arc<Vec<ColumnDef>>, Instant)>,
+    pk: HashMap<String, (Arc<str>, Instant)>,
     ttl: Duration,
 }
 
@@ -36,7 +38,7 @@ impl SchemaCache {
         if Self::is_expired(*created, self.ttl) {
             return None;
         }
-        Some(cols.clone())
+        Some((**cols).clone())
     }
 
     pub fn get_pk(&self, table: &str) -> Option<String> {
@@ -44,16 +46,18 @@ impl SchemaCache {
         if Self::is_expired(*created, self.ttl) {
             return None;
         }
-        Some(pk.clone())
+        Some((*pk).to_string())
     }
 
+    /// Takes ownership of `columns` to avoid clone at call site.
     pub fn set_columns(&mut self, table: &str, columns: Vec<ColumnDef>) {
         self.columns
-            .insert(table.to_string(), (columns, Instant::now()));
+            .insert(table.to_string(), (Arc::new(columns), Instant::now()));
     }
 
-    pub fn set_pk(&mut self, table: &str, pk: String) {
-        self.pk.insert(table.to_string(), (pk, Instant::now()));
+    pub fn set_pk(&mut self, table: &str, pk: &str) {
+        self.pk
+            .insert(table.to_string(), (Arc::from(pk), Instant::now()));
     }
 
     /// Remove cached columns and PK for a table. Call after DDL (CREATE TABLE, DROP TABLE, ALTER).

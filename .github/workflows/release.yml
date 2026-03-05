@@ -124,6 +124,7 @@ jobs:
           mkdir staging
           cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} staging/
           cp manifest.json staging/
+          cp icon.svg staging/
           cd staging && zip -r ../redis-plugin-${{ matrix.platform }}.zip .
 
       - name: Package (windows)
@@ -133,6 +134,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path staging
           Copy-Item "target\${{ matrix.target }}\release\${{ env.BINARY_NAME }}.exe" staging\
           Copy-Item "manifest.json" staging\
+          Copy-Item "icon.svg" staging\
           Compress-Archive -Path "staging\*" -DestinationPath "redis-plugin-${{ matrix.platform }}.zip"
 
       - name: Upload artifact
