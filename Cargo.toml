@@ -1,11 +1,11 @@
 [package]
-name = "tabularis-redis-plugin"
-version = "0.1.0"
+name = "tabularis-redis-plugin-rust"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 
 [[bin]]
-name = "tabularis-redis-plugin"
+name = "tabularis-redis-plugin-rust"
 path = "src/main.rs"
 
 [[bin]]

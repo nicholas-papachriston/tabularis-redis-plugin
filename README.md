@@ -1,4 +1,4 @@
-# tabularis-redis-plugin
+# tabularis-redis-plugin-rust
 
 A [Redis](https://redis.io/) plugin for [Tabularis](https://github.com/debba/tabularis), the lightweight database management tool.
 
@@ -54,14 +54,14 @@ If your version of Tabularis supports plugin management, the Redis plugin can be
 
 1. Download the latest release for your platform from the [Releases page](https://github.com/tabularis-plugins/tabularis-redis-plugin/releases).
 2. Extract the archive.
-3. Copy `tabularis-redis-plugin` (or `tabularis-redis-plugin.exe` on Windows), `manifest.json`, and `icon.svg` into the Tabularis plugins directory:
+3. Copy `tabularis-redis-plugin-rust` (or `tabularis-redis-plugin-rust.exe` on Windows), `manifest.json`, and `icon.svg` into the Tabularis plugins directory:
 4. Restart Tabularis to load the plugin.
 
 | OS | Plugins Directory |
 | --- | --- |
-| **Linux** | `~/.local/share/tabularis/plugins/redis/` |
-| **macOS** | `~/Library/Application Support/com.debba.tabularis/plugins/redis/` |
-| **Windows** | `%APPDATA%\com.debba.tabularis\plugins\redis\` |
+| **Linux** | `~/.local/share/tabularis/plugins/redis-rust/` |
+| **macOS** | `~/Library/Application Support/com.debba.tabularis/plugins/redis-rust/` |
+| **Windows** | `%APPDATA%\com.debba.tabularis\plugins\redis-rust\` |
 
 ## How It Works
 
@@ -117,7 +117,7 @@ One Redis connection is cached per session. Key discovery uses SCAN with pipelin
 cargo build --release
 ```
 
-The binary will be located at `target/release/tabularis-redis-plugin`.
+The binary will be located at `target/release/tabularis-redis-plugin-rust`.
 
 ### Install Locally
 

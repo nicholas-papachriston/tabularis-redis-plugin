@@ -65,26 +65,26 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir staging
-          cp target/${{ matrix.target }}/release/tabularis-redis-plugin staging/
+          cp target/${{ matrix.target }}/release/tabularis-redis-plugin-rust staging/
           cp manifest.json staging/
           cp icon.svg staging/
-          cd staging && zip -r ../redis-plugin-${{ matrix.platform }}.zip .
+          cd staging && zip -r ../redis-plugin-rust-${{ matrix.platform }}.zip .
 
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path staging
-          Copy-Item "target\${{ matrix.target }}\release\tabularis-redis-plugin.exe" staging\
+          Copy-Item "target\${{ matrix.target }}\release\tabularis-redis-plugin-rust.exe" staging\
           Copy-Item "manifest.json" staging\
           Copy-Item "icon.svg" staging\
-          Compress-Archive -Path "staging\*" -DestinationPath "redis-plugin-${{ matrix.platform }}.zip"
+          Compress-Archive -Path "staging\*" -DestinationPath "redis-plugin-rust-${{ matrix.platform }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: redis-plugin-${{ matrix.platform }}
-          path: redis-plugin-${{ matrix.platform }}.zip
+          name: redis-plugin-rust-${{ matrix.platform }}
+          path: redis-plugin-rust-${{ matrix.platform }}.zip
           retention-days: 90
 
   release:
@@ -108,7 +108,7 @@ jobs:
         uses: actions/download-artifact@v5
         with:
           path: artifacts
-          pattern: redis-plugin-*
+          pattern: redis-plugin-rust-*
           merge-multiple: true
 
       - name: Generate CHANGELOG.md

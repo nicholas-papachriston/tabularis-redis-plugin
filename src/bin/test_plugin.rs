@@ -101,7 +101,7 @@ fn publish_test_message(channel: &str, payload: &str) {
 #[allow(clippy::too_many_lines)]
 fn main() {
     let mut child = Command::new("cargo")
-        .args(["run", "--bin", "tabularis-redis-plugin", "--quiet"])
+        .args(["run", "--bin", "tabularis-redis-plugin-rust", "--quiet"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
