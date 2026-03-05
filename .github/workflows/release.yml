@@ -34,9 +34,10 @@ jobs:
         with:
           script: |
             const { owner, repo } = context.repo;
-            const { data } = await github.rest.actions.listWorkflowRunsForRepo({
+            const { data } = await github.rest.actions.listWorkflowRuns({
               owner,
               repo,
+              workflow_id: "build.yml",
               head_sha: context.sha,
               status: "completed",
               per_page: 100
@@ -45,8 +46,7 @@ jobs:
             const candidates = data.workflow_runs.filter((run) =>
               run.conclusion === "success" &&
               run.event === "push" &&
-              run.head_branch === "main" &&
-              (run.path || "").startsWith(".github/workflows/build.yml@")
+              run.head_branch === "main"
             );
 
             if (candidates.length === 0) {
