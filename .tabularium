@@ -1,0 +1,54 @@
+{
+  "name": "redis-rust",
+  "version": "0.2.0",
+  "kind": "driver",
+  "description": "Redis key-value store with Hash and RedisJSON row storage",
+  "engine": "redis",
+  "paradigms": [
+    "key-value"
+  ],
+  "tags": [
+    "driver",
+    "redis",
+    "key-value",
+    "nosql",
+    "rust"
+  ],
+  "icon": "icon.svg",
+  "readme": "README.md",
+  "homepage": "https://github.com/nicholas-papachriston/tabularis-redis-plugin",
+  "support": {
+    "issues_url": "https://github.com/nicholas-papachriston/tabularis-redis-plugin/issues"
+  },
+  "default_port": 6379,
+  "default_username": "default",
+  "executable": "tabularis-redis-plugin-rust",
+  "color": "#D82C20",
+  "capabilities": {
+    "schemas": false,
+    "views": false,
+    "routines": false,
+    "file_based": false,
+    "folder_based": false,
+    "identifier_quote": "\"",
+    "alter_primary_key": false,
+    "auto_increment_keyword": "",
+    "serial_type": "",
+    "inline_pk": false,
+    "alter_column": true,
+    "create_foreign_keys": false
+  },
+  "data_types": [
+    { "name": "BOOLEAN", "category": "other", "requires_length": false, "requires_precision": false },
+    { "name": "INTEGER", "category": "numeric", "requires_length": false, "requires_precision": false },
+    { "name": "BIGINT", "category": "numeric", "requires_length": false, "requires_precision": false },
+    { "name": "FLOAT", "category": "numeric", "requires_length": false, "requires_precision": false },
+    { "name": "DOUBLE", "category": "numeric", "requires_length": false, "requires_precision": false },
+    { "name": "VARCHAR", "category": "string", "requires_length": true, "requires_precision": false, "default_length": "255" },
+    { "name": "TEXT", "category": "string", "requires_length": false, "requires_precision": false },
+    { "name": "DATE", "category": "date", "requires_length": false, "requires_precision": false },
+    { "name": "TIMESTAMP", "category": "date", "requires_length": false, "requires_precision": false },
+    { "name": "JSON", "category": "json", "requires_length": false, "requires_precision": false },
+    { "name": "UUID", "category": "string", "requires_length": false, "requires_precision": false }
+  ]
+}
